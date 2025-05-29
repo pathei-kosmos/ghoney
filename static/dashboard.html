@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ghoney - Real-time Attack Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>🍯 ghoney - Real-time Attack Dashboard</h1>
+    </header>
+    <main>
+        <div class="grid-container">
+            <section id="attack-log" class="card">
+                <h2>Recent Activity (Last <span id="log-count-display">0</span> Events)</h2>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Timestamp</th>
+                                <th>IP Address</th>
+                                <th>User Agent</th>
+                                <th>Path</th>
+                                <th>Attack Type</th>
+                                <th>Details</th>
+                            </tr>
+                        </thead>
+                        <tbody id="attack-log-body">
+                            <!-- Log entries will be populated here by app.js -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <section id="top-attackers" class="card">
+                <h2>Top Attacking IPs</h2>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>IP Address</th>
+                                <th>Count</th>
+                            </tr>
+                        </thead>
+                        <tbody id="top-ips-body">
+                            <!-- Top IPs will be populated here -->
+                        </tbody>
+                    </table>
+            </section>
+
+            <section id="top-user-agents" class="card">
+                <h2>Top User Agents</h2>
+                 <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>User Agent</th>
+                                <th>Count</th>
+                            </tr>
+                        </thead>
+                        <tbody id="top-uas-body">
+                            <!-- Top UAs will be populated here -->
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+            
+            <section id="payload-keywords" class="card">
+                <h2>Common Payload Keywords</h2>
+                <ul id="keywords-list">
+                    <!-- Keywords will be populated here -->
+                </ul>
+            </section>
+            
+            <section id="attack-map-placeholder" class="card">
+                <h2>Attacker Origins</h2>
+                <p>This is a placeholder for a geolocation map. In a full system, IPs would be geolocated.</p>
+                <ul id="ip-origins-list">
+                    <!-- IPs with counts, representing origins -->
+                </ul>
+            </section>
+        </div>
+    </main>
+    <footer>
+        <p>ghoney - A Minimalist HTTP Honeypot Canary Server</p>
+    </footer>
+    <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin Login - Ghoney System</title>
+    <style>
+        :root {
+            --primary-color: #007bff;
+            --primary-hover-color: #0056b3;
+            --background-color: #f4f7f6;
+            --card-background-color: #ffffff;
+            --text-color: #333333;
+            --border-color: #dddddd;
+            --input-focus-border: #80bdff;
+            --shadow-color: rgba(0, 0, 0, 0.1);
+            --logo-color: #f0ad4e;
+        }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            background-color: var(--background-color);
+            margin: 0;
+            padding: 15px;
+            box-sizing: border-box;
+        }
+
+        .login-container {
+            background-color: var(--card-background-color);
+            padding: 30px 40px;
+            border-radius: 12px;
+            box-shadow: 0 6px 20px var(--shadow-color);
+            width: 100%;
+            max-width: 400px;
+            text-align: center;
+            box-sizing: border-box;
+        }
+
+        .login-container h2 {
+            margin-top: 0;
+            margin-bottom: 25px;
+            color: var(--text-color);
+            font-weight: 600;
+            font-size: 1.75em;
+        }
+
+        .login-container .logo {
+            font-size: 2.5em;
+            color: var(--logo-color);
+            margin-bottom: 10px;
+            line-height: 1;
+        }
+        .login-container .logo-text {
+            font-size: 1.2em;
+            font-weight: 500;
+            color: var(--text-color);
+            margin-bottom: 20px;
+        }
+
+        .form-group {
+            margin-bottom: 20px;
+            text-align: left;
+        }
+
+        .login-container input[type="text"],
+        .login-container input[type="password"] {
+            width: 100%;
+            padding: 12px 15px;
+            border: 1px solid var(--border-color);
+            border-radius: 6px;
+            box-sizing: border-box;
+            font-size: 1em;
+            transition: border-color 0.15s ease-in-out, box-shadow 0.15s ease-in-out;
+        }
+
+        .login-container input[type="text"]:focus,
+        .login-container input[type="password"]:focus {
+            border-color: var(--input-focus-border);
+            outline: 0;
+            box-shadow: 0 0 0 0.2rem rgba(0, 123, 255, 0.25);
+        }
+
+        .login-container button {
+            width: 100%;
+            padding: 12px 15px;
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 1.1em;
+            font-weight: 500;
+            transition: background-color 0.15s ease-in-out;
+        }
+
+        .login-container button:hover {
+            background-color: var(--primary-hover-color);
+        }
+
+        /* Responsive adjustments */
+        @media (max-width: 480px) {
+            .login-container {
+                padding: 25px 20px;
+            }
+            .login-container h2 {
+                font-size: 1.5em;
+            }
+            .login-container .logo {
+                font-size: 2em;
+            }
+        }
+
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="logo">🍯</div>
+        <div class="logo-text">Ghoney Control Panel</div>
+        <h2>Administrator Login</h2>
+        <form id="loginForm" onsubmit="return handleSubmit();">
+            <div class="form-group">
+                <input type="text" id="username" name="username" placeholder="Username" required>
+            </div>
+            <div class="form-group">
+                <input type="password" id="password" name="password" placeholder="Password" required>
+            </div>
+            <button type="submit">Sign In</button>
+        </form>
+        <!-- 
+            Credentials "accidentally" left in script tags
+            <script type="text/javascript">
+                // For internal testing only, remove before production!
+                // const temp_user = "service_account_01";
+                // const temp_pass = "S3rv1ceP@ssw0rdF0rGhoney"; 
+                // Or an API endpoint:
+                // const internalApi = "/api/v0/internal/debug_access?token=debug_token_value_axbycz";
+            </script>
+        -->
+    </div>
+
+    <script>
+        function handleSubmit() {
+            // Clear form
+            document.getElementById("loginForm").reset();
+            return false; // Prevent actual form submission
+        }
+    </script>
+</body>
+</html>
