@@ -41,6 +41,10 @@ main {
     gap: 20px;
 }
 
+#attack-log {
+    grid-column: 1 / -1;
+}
+
 .card {
     background-color: var(--card-bg-color);
     padding: 20px;
@@ -60,8 +64,13 @@ main {
 .table-wrapper {
     max-height: 400px;
     overflow-y: auto;
+    overflow-x: auto;
     border: 1px solid var(--border-color);
     border-radius: 4px;
+}
+
+.table-wide table {
+    min-width: 900px;
 }
 
 table {
@@ -74,15 +83,20 @@ th, td {
     padding: 10px 12px;
     border-bottom: 1px solid var(--border-color);
     font-size: 0.9em;
-    word-break: break-word;
+    word-break: normal;
 }
 
 th {
     background-color: var(--table-header-bg);
     color: var(--text-color);
+    white-space: nowrap;
     position: sticky; 
     top: 0;
     z-index: 1;
+}
+
+td {
+    overflow-wrap: anywhere;
 }
 
 tbody tr:nth-child(even) {
@@ -150,6 +164,12 @@ footer {
     }
     .grid-container {
         grid-template-columns: 1fr;
+    }
+    .table-wide table {
+        min-width: 0;
+    }
+    th {
+        white-space: normal;
     }
     th, td {
         font-size: 0.85em;

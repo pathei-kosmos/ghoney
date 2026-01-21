@@ -37,21 +37,14 @@
     ```
 
 4.  **Run the `ghoney` Container**:
+    *   **4.a (with gVisor `runsc`)**:
     ```bash
-    docker run -d \
-      --name ghoney_server \
-      --runtime=runsc \
-      --security-opt seccomp=$(pwd)/seccomp.json \
-      --security-opt no-new-privileges \
-      -p 80:8080 \
-      --restart unless-stopped \
-      --read-only \
-      --tmpfs /tmp \
-      --tmpfs /run \
-      --log-driver=json-file \
-      --log-opt max-size=10m \
-      --log-opt max-file=3 \
-      ghoney:latest
+    docker run -d --name ghoney_server --runtime=runsc --security-opt seccomp=$(pwd)/seccomp.json --security-opt no-new-privileges -p 80:8080 --restart unless-stopped --read-only --tmpfs /tmp --tmpfs /run --log-driver=json-file --log-opt max-size=10m --log-opt max-file=3 ghoney:latest
+    ```
+    *   **4.b (default Docker runtime)**:
+        *   Same container, but without the gVisor sandbox (less isolation).
+    ```bash
+    docker run -d --name ghoney_server --security-opt no-new-privileges -p 80:8080 --restart unless-stopped --read-only --tmpfs /tmp --tmpfs /run --log-driver=json-file --log-opt max-size=10m --log-opt max-file=3 ghoney:latest
     ```
 
 5.  **Access `ghoney`**:
@@ -103,7 +96,7 @@ graph TD
     *   Mimics a publicly exposed Git configuration file. Returns plausible-looking fake `.git/config` content, including fake internal Git repository URLs and commented-out "sensitive" data like a fake CI token or credentials in a URL.
 
 *   **Attack Detection**:
-    *   Basic pattern matching for SQL injection (`' OR '1'='1`), path traversal (`../`), and common XML bomb indicators (`<!ENTITY` in payload snippets).
+    *   Basic pattern matching for SQL injection (`' OR '1'='1`, `UNION SELECT`), path traversal (`../`), XML bomb indicators (`<!ENTITY`), command injection (`;`, `&&`, `|`), SSRF (`http://`, `169.254.169.254`), and LFI/RFI (`/etc/passwd`, `php://`).
     *   Detection occurs on query parameters and (limited-size) request bodies.
 *   **Random Delays**:
     *   Non-honeypot, undefined paths return HTTP 404 with a random delay of 1-3 seconds to mimic a real, possibly struggling, server and to slow down aggressive scanners.
@@ -123,7 +116,31 @@ The dashboard provides a real-time view of activity targeting the honeypot.
 *   **Top Attacking IPs Table**: Lists IPs with the highest number of logged events.
 *   **Top User Agents Table**: Lists most frequent User-Agents.
 *   **Common Payload Keywords List**: Shows frequently detected keywords.
-*   **Attacker Origins sList**: Lists top IPs with counts as a placeholder for a map.
+*   **Attacker Origins List**: Lists top IPs with counts as a placeholder for a map.
+
+## 🧪 Detection Tests
+
+Run these requests to generate example events:
+
+```bash
+# SQL injection
+curl -X POST "http://localhost/api/v1/auth" -H "Content-Type: application/x-www-form-urlencoded" --data "u=' OR 1=1 --"
+
+# Path traversal
+curl "http://localhost/?p=..%2F..%2Fetc%2Fpasswd"
+
+# XML bomb indicator
+curl -X POST "http://localhost/" -H "Content-Type: application/xml" --data "<!ENTITY x SYSTEM \"file:///etc/passwd\">"
+
+# Command injection
+curl "http://localhost/?cmd=whoami%20%26%26%20id"
+
+# SSRF
+curl "http://localhost/?url=http://169.254.169.254/latest/meta-data/"
+
+# LFI/RFI
+curl "http://localhost/?file=php://filter/read=convert.base64-encode/resource=/etc/passwd"
+```
 
 ## 🛡️ Security
 

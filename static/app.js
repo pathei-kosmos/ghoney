@@ -45,6 +45,19 @@ document.addEventListener('DOMContentLoaded', function() {
         temp.textContent = text;
         return temp.innerHTML;
     }
+    
+    // Decode HTML entities from server-escaped payloads for display
+    function decodeHtmlEntities(text) {
+        if (!text) {
+            return '';
+        }
+        const temp = document.createElement('textarea');
+        temp.innerHTML = text;
+        const once = temp.value;
+        // Handle double-escaped sequences like "&amp;#39;"
+        temp.innerHTML = once;
+        return temp.value;
+    }
 
     async function fetchData() {
         try {
@@ -76,6 +89,8 @@ document.addEventListener('DOMContentLoaded', function() {
         if (attackLogBody) {
             let logHtml = '';
             logs.slice(0, 50).forEach(log => { // Display max 50 recent logs
+                const safeQuery = sanitize(decodeHtmlEntities(log.rawQuery));
+                const safeBody = sanitize(decodeHtmlEntities(log.bodySnippet));
                 logHtml += `
                     <tr>
                         <td>${sanitize(new Date(log.timestamp).toLocaleString())}</td>
@@ -83,7 +98,7 @@ document.addEventListener('DOMContentLoaded', function() {
                         <td>${sanitize(log.userAgent)}</td>
                         <td>${sanitize(log.path)}</td>
                         <td>${sanitize(log.attackType)}</td>
-                        <td>${sanitize(log.details)}<br><small><em>Query: ${sanitize(log.rawQuery)}</em></small><br><small><em>Body: ${sanitize(log.bodySnippet)}</em></small></td>
+                        <td>${sanitize(log.details)}<br><small><em>Query: ${safeQuery}</em></small><br><small><em>Body: ${safeBody}</em></small></td>
                     </tr>
                 `;
             });

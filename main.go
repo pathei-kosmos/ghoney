@@ -73,8 +73,13 @@ var (
 	)
 
 	// Precompiled regex for attack detection
-	sqlRegex     = regexp.MustCompile(`(?i)('|\")(?:--|#|\s*(?:OR|AND)\s+(?:\d+|'[^']*'|\"[^\"]*\")\s*=\s*(?:\d+|'[^']*'|\"[^\"]*\"))`)
-	xmlBombRegex = regexp.MustCompile(`(?i)<!ENTITY\s+\S+\s+SYSTEM`)
+	sqlRegex      = regexp.MustCompile(`(?i)('|\")(?:--|#|\s*(?:OR|AND)\s+(?:\d+|'[^']*'|\"[^\"]*\")\s*=\s*(?:\d+|'[^']*'|\"[^\"]*\"))`)
+	sqliExtraRegex = regexp.MustCompile(`(?i)\bunion\s+select\b|\bsleep\s*\(|\bbenchmark\s*\(|\bwaitfor\s+delay\b`)
+	xmlBombRegex  = regexp.MustCompile(`(?i)<!ENTITY\s+\S+\s+SYSTEM`)
+	cmdiRegex     = regexp.MustCompile("(?i)(?:;|\\|\\||&&|\\$\\(|`)[^\\n]{0,100}(?:whoami|id|uname|cat|curl|wget|ping)")
+	ssrfParamRegex = regexp.MustCompile(`(?i)(?:\burl\b|\buri\b|\bredirect\b|\bnext\b|\btarget\b|\bdest\b|\bdestination\b)\s*=\s*https?://`)
+	ssrfHostRegex  = regexp.MustCompile(`(?i)\b169\.254\.169\.254\b|\blocalhost\b|\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}\b`)
+	lfiRegex      = regexp.MustCompile(`(?i)/etc/passwd|/proc/self/environ|\bphp://|\bfile://|\bdata:`)
 )
 
 // PRNG uses crypto/rand for better non-determinism in delays
@@ -170,19 +175,6 @@ func requestLogAndTrapMiddleware(next http.Handler) http.Handler {
 		path := r.URL.Path
 		rawQuery := r.URL.RawQuery // Keep raw query for logging
 
-		// Decode query for detection purposes
-		var decodedQuery string
-		if rawQuery != "" {
-			dq, err := url.QueryUnescape(rawQuery)
-			if err == nil {
-				decodedQuery = dq
-			} else {
-				fmt.Printf("level=error ts=%s ip=\"%s\" msg=\"QueryUnescapeError\" path=\"%s\" query=\"%s\" error=\"%v\"\n",
-					time.Now().UTC().Format(time.RFC3339), clientIP, path, rawQuery, err)
-				decodedQuery = rawQuery // Fallback to raw if unescape fails
-			}
-		}
-
 		if _, err := r.Cookie(cookieName); err != nil {
 			http.SetCookie(w, &http.Cookie{
 				Name: cookieName, Value: "1", Path: "/", HttpOnly: true,
@@ -192,6 +184,29 @@ func requestLogAndTrapMiddleware(next http.Handler) http.Handler {
 
 		var bodyBytes []byte
 		var bodySnippet string
+		if r.Body != nil {
+			if r.ContentLength < 0 {
+				var err error
+				bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
+				if err != nil {
+					fmt.Printf("level=error ts=%s ip=\"%s\" msg=\"BodyReadError\" path=\"%s\" error=\"%v\"\n",
+						time.Now().UTC().Format(time.RFC3339), clientIP, path, err)
+				}
+				if len(bodyBytes) > maxRequestBodySize {
+					logEvent("warn", clientIP, userAgent, path, "LargeBody",
+						fmt.Sprintf("Body size > %d", maxRequestBodySize), rawQuery, "")
+					http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+					httpRequestsTotal.WithLabelValues(path, r.Method, fmt.Sprintf("%d", http.StatusRequestEntityTooLarge)).Inc()
+					return
+				}
+				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
+				if len(bodyBytes) > 256 {
+					bodySnippet = string(bodyBytes[:256])
+				} else {
+					bodySnippet = string(bodyBytes)
+				}
+			}
+		}
 		if r.Body != nil && r.ContentLength > 0 {
 			if r.ContentLength > maxRequestBodySize {
 				logEvent("warn", clientIP, userAgent, path, "LargeBody",
@@ -220,24 +235,62 @@ func requestLogAndTrapMiddleware(next http.Handler) http.Handler {
 		attackType := "None"
 		details := ""
 
-		// Path Traversal (checks path and decoded query)
-		if strings.Contains(path, "../") || (decodedQuery != "" && strings.Contains(decodedQuery, "../")) {
-			attackType = "Path Traversal"
-			details = "Detected '../' in path or query"
+		normalizeForDetection := func(s string) string {
+			if s == "" {
+				return ""
+			}
+			out := strings.ReplaceAll(s, "+", " ")
+			for i := 0; i < 2; i++ {
+				u, err := url.QueryUnescape(out)
+				if err != nil {
+					break
+				}
+				out = u
+			}
+			out = html.UnescapeString(out)
+			out = strings.ToLower(out)
+			out = strings.Join(strings.Fields(out), " ")
+			return out
 		}
 
-		// SQL Injection (checks decoded query and body snippet)
+		normalized := normalizeForDetection(path + " " + rawQuery + " " + bodySnippet)
+
+		// Path Traversal (checks path, query, body)
+		if strings.Contains(normalized, "../") || strings.Contains(normalized, "..\\") {
+			attackType = "Path Traversal"
+			details = "Detected '../' in path, query, or body"
+		}
+
+		// SQL Injection (checks query and body snippet)
 		// Ensure attackType is not overwritten if Path Traversal was already found
-		if attackType == "None" && ((decodedQuery != "" && sqlRegex.MatchString(decodedQuery)) || (bodySnippet != "" && sqlRegex.MatchString(bodySnippet))) {
+		if attackType == "None" && (sqlRegex.MatchString(normalized) || sqliExtraRegex.MatchString(normalized)) {
 			attackType = "SQL Injection"
 			details = "Detected SQLi pattern in query or body"
 		}
 
 		// XML Bomb (checks body snippet)
 		// Ensure attackType is not overwritten
-		if attackType == "None" && bodySnippet != "" && xmlBombRegex.MatchString(bodySnippet) {
+		if attackType == "None" && bodySnippet != "" && xmlBombRegex.MatchString(normalized) {
 			attackType = "XML Bomb"
 			details = "Detected XML bomb pattern in body"
+		}
+		
+		// Command Injection
+		if attackType == "None" && cmdiRegex.MatchString(normalized) {
+			attackType = "Command Injection"
+			details = "Detected command injection pattern"
+		}
+		
+		// SSRF
+		if attackType == "None" && (ssrfHostRegex.MatchString(normalized) && ssrfParamRegex.MatchString(normalized)) {
+			attackType = "SSRF"
+			details = "Detected SSRF pattern"
+		}
+		
+		// LFI/RFI
+		if attackType == "None" && lfiRegex.MatchString(normalized) {
+			attackType = "LFI/RFI"
+			details = "Detected local/remote file inclusion pattern"
 		}
 
 		// Logging based on detection or honeypot access
@@ -356,7 +409,7 @@ func main() {
 	fs := http.FileServer(http.Dir("./static"))
 	mux.Handle("/static/", http.StripPrefix("/static/", fs))
 	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "static/index.html")
+		http.ServeFile(w, r, "static/dashboard.html")
 	})
 
 	mux.HandleFunc("/api/dashboard-data", handleDashboardData)
