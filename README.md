@@ -11,9 +11,7 @@
 
 **A small HTTP canary for the noisy parts of the internet.**
 
-[![Go 1.24.3](https://img.shields.io/badge/Go-1.24.3-00ADD8?logo=go&logoColor=white)](https://go.dev/)
-[![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)](LICENSE)
+[![Go 1.24.3](https://img.shields.io/badge/Go-1.24.3-00ADD8?logo=go&logoColor=white)](https://go.dev/) [![Docker](https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white)](https://www.docker.com/) [![License: MIT](https://img.shields.io/badge/License-MIT-black.svg)](LICENSE)
 
 **ghoney** exposes believable bait endpoints, detects common attack patterns, and turns the resulting traffic into structured logs, [Prometheus](https://prometheus.io/) metrics, and a live dashboard. It stays deliberately small and ephemeral, with a [Distroless](https://github.com/GoogleContainerTools/distroless) image, a non-root runtime, a read-only filesystem, and optional [gVisor](https://gvisor.dev/) + [seccomp](https://en.wikipedia.org/wiki/Seccomp) isolation.
 
