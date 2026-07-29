@@ -9,6 +9,7 @@
 <body>
     <header>
         <h1>🍯 ghoney - Real-time Attack Dashboard</h1>
+        <p id="connection-status" class="connection-status" aria-live="polite">Connecting…</p>
     </header>
     <main>
         <div class="grid-container">
@@ -27,7 +28,7 @@
                             </tr>
                         </thead>
                         <tbody id="attack-log-body">
-                            <!-- Log entries will be populated here by app.js -->
+                            <!-- app.js renders event rows here -->
                         </tbody>
                     </table>
                 </div>
@@ -44,7 +45,7 @@
                             </tr>
                         </thead>
                         <tbody id="top-ips-body">
-                            <!-- Top IPs will be populated here -->
+                            <!-- app.js renders IP counts here -->
                         </tbody>
                     </table>
                 </div>
@@ -61,7 +62,7 @@
                             </tr>
                         </thead>
                         <tbody id="top-uas-body">
-                            <!-- Top UAs will be populated here -->
+                            <!-- app.js renders user-agent counts here -->
                         </tbody>
                     </table>
                 </div>
@@ -70,16 +71,25 @@
             <section id="payload-keywords" class="card">
                 <h2>Common Payload Keywords</h2>
                 <ul id="keywords-list">
-                    <!-- Keywords will be populated here -->
+                    <!-- app.js renders keywords here -->
                 </ul>
             </section>
             
-            <section id="attack-map-placeholder" class="card">
-                <h2>Attacker Origins</h2>
-                <p>This is a placeholder for a geolocation map. In a full system, IPs would be geolocated.</p>
-                <ul id="ip-origins-list">
-                    <!-- IPs with counts, representing origins -->
-                </ul>
+            <section id="attack-types" class="card">
+                <h2>Attack Types</h2>
+                <div class="table-wrapper">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Type</th>
+                                <th>Count</th>
+                            </tr>
+                        </thead>
+                        <tbody id="attack-types-body">
+                            <!-- app.js renders attack counts here -->
+                        </tbody>
+                    </table>
+                </div>
             </section>
         </div>
     </main>

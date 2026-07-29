@@ -31,6 +31,17 @@ header h1 {
     font-size: 2em;
 }
 
+/* Keep connection state visually secondary */
+.connection-status {
+    margin: 6px 0 0;
+    color: #aebbd6;
+    font-size: 0.85em;
+}
+
+.status-error {
+    color: #ff9b9b;
+}
+
 main {
     padding: 20px;
 }
@@ -99,6 +110,16 @@ td {
     overflow-wrap: anywhere;
 }
 
+td small {
+    display: block;
+}
+
+.empty-state {
+    padding: 32px;
+    color: #aebbd6;
+    text-align: center;
+}
+
 tbody tr:nth-child(even) {
     background-color: rgba(255, 255, 255, 0.03);
 }
@@ -107,18 +128,18 @@ tbody tr:hover {
     background-color: var(--table-row-hover);
 }
 
-#keywords-list, #ip-origins-list {
+#keywords-list {
     list-style-type: none;
     padding-left: 0;
     max-height: 300px;
     overflow-y: auto;
 }
 
-#keywords-list li, #ip-origins-list li {
+#keywords-list li {
     padding: 6px 0;
     border-bottom: 1px dashed var(--border-color);
 }
-#keywords-list li:last-child, #ip-origins-list li:last-child {
+#keywords-list li:last-child {
     border-bottom: none;
 }
 
@@ -131,33 +152,29 @@ footer {
     font-size: 0.9em;
 }
 
-/* Scrollbar styling for webkit browsers */
+/* Compact scrollbars for WebKit */
 .table-wrapper::-webkit-scrollbar, 
-#keywords-list::-webkit-scrollbar,
-#ip-origins-list::-webkit-scrollbar {
+#keywords-list::-webkit-scrollbar {
     width: 8px;
 }
 
 .table-wrapper::-webkit-scrollbar-track,
-#keywords-list::-webkit-scrollbar-track,
-#ip-origins-list::-webkit-scrollbar-track {
+#keywords-list::-webkit-scrollbar-track {
     background: var(--bg-color);
 }
 
 .table-wrapper::-webkit-scrollbar-thumb,
-#keywords-list::-webkit-scrollbar-thumb,
-#ip-origins-list::-webkit-scrollbar-thumb {
+#keywords-list::-webkit-scrollbar-thumb {
     background-color: var(--border-color);
     border-radius: 4px;
 }
 
 .table-wrapper::-webkit-scrollbar-thumb:hover,
-#keywords-list::-webkit-scrollbar-thumb:hover,
-#ip-origins-list::-webkit-scrollbar-thumb:hover {
+#keywords-list::-webkit-scrollbar-thumb:hover {
     background-color: var(--header-color);
 }
 
-/* Responsive adjustments */
+/* Single-column layout on narrow screens */
 @media (max-width: 768px) {
     header h1 {
         font-size: 1.5em;

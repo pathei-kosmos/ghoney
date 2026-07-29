@@ -1,184 +1,194 @@
-document.addEventListener('DOMContentLoaded', function() {
+document.addEventListener('DOMContentLoaded', () => {
     const API_ENDPOINT = '/api/dashboard-data';
-    const FETCH_INTERVAL = 3000; // Fetch data every 3 seconds
+    const FETCH_INTERVAL_MS = 3000;
+    const FETCH_TIMEOUT_MS = 5000;
+    const elements = {
+        count: document.getElementById('log-count-display'),
+        status: document.getElementById('connection-status'),
+        activity: document.getElementById('attack-log-body'),
+        topIps: document.getElementById('top-ips-body'),
+        topUas: document.getElementById('top-uas-body'),
+        attackTypes: document.getElementById('attack-types-body'),
+        keywords: document.getElementById('keywords-list')
+    };
+    let fetchInProgress = false;
 
-    const logCountDisplay = document.getElementById('log-count-display');
-    const attackLogBody = document.getElementById('attack-log-body');
-    const topIpsBody = document.getElementById('top-ips-body');
-    const topUasBody = document.getElementById('top-uas-body');
-    const keywordsList = document.getElementById('keywords-list');
-    const ipOriginsList = document.getElementById('ip-origins-list');
+    // Drop existing nodes without parsing HTML
+    function clear(element) {
+        element.replaceChildren();
+    }
 
-    // Helper to safely update table body content
-    function updateTableBody(tbodyElement, rowsHtml) {
-        // Clear existing rows more efficiently than innerHTML = ''
-        while (tbodyElement.firstChild) {
-            tbodyElement.removeChild(tbodyElement.firstChild);
-        }
-        // Use a DocumentFragment for better performance when adding rows
-        const fragment = document.createDocumentFragment();
-        const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = `<table><tbody>${rowsHtml}</tbody></table>`; // Wrap in table/tbody to parse <tr>
-        Array.from(tempDiv.querySelector('tbody').children).forEach(row => {
-            fragment.appendChild(row);
+    // Build cells from text nodes only
+    function textCell(value) {
+        const cell = document.createElement('td');
+        cell.textContent = String(value ?? '');
+        return cell;
+    }
+
+    // Render payload details without creating markup
+    function detailCell(log) {
+        const cell = document.createElement('td');
+        const summary = document.createElement('div');
+        summary.textContent = String(log.details ?? '');
+        cell.appendChild(summary);
+
+        [['Query', log.rawQuery], ['Body', log.bodySnippet]].forEach(([label, value]) => {
+            const line = document.createElement('small');
+            const emphasis = document.createElement('em');
+            emphasis.textContent = `${label}: ${String(value ?? '')}`;
+            line.appendChild(emphasis);
+            cell.appendChild(line);
         });
-        tbodyElement.appendChild(fragment);
-    }
-    
-    // Helper to safely update list content
-    function updateList(ulElement, itemsHtml) {
-        while (ulElement.firstChild) {
-            ulElement.removeChild(ulElement.firstChild);
-        }
-        const fragment = document.createDocumentFragment();
-        const tempDiv = document.createElement('div');
-        tempDiv.innerHTML = `<ul>${itemsHtml}</ul>`; // Wrap in ul to parse <li>
-        Array.from(tempDiv.querySelector('ul').children).forEach(item => {
-            fragment.appendChild(item);
-        });
-        ulElement.appendChild(fragment);
+        return cell;
     }
 
-    // Sanitize text content to prevent XSS
-    function sanitize(text) {
-        const temp = document.createElement('div');
-        temp.textContent = text;
-        return temp.innerHTML;
-    }
-    
-    // Decode HTML entities from server-escaped payloads for display
-    function decodeHtmlEntities(text) {
-        if (!text) {
-            return '';
-        }
-        const temp = document.createElement('textarea');
-        temp.innerHTML = text;
-        const once = temp.value;
-        // Handle double-escaped sequences like "&amp;#39;"
-        temp.innerHTML = once;
-        return temp.value;
-    }
-
-    async function fetchData() {
-        try {
-            const response = await fetch(API_ENDPOINT);
-            if (!response.ok) {
-                console.error('Failed to fetch dashboard data:', response.status, response.statusText);
-                // Display an error message on the dashboard
-                return;
-            }
-            const data = await response.json();
-            updateDashboard(data);
-        } catch (error) {
-            console.error('Error fetching or processing dashboard data:', error);
-        }
-    }
-
-    function updateDashboard(logs) {
-        if (!Array.isArray(logs)) {
-            console.error("Received non-array data for logs:", logs);
+    // Render the newest events first
+    function renderActivity(logs) {
+        clear(elements.activity);
+        if (logs.length === 0) {
+            const row = document.createElement('tr');
+            const cell = textCell('No events detected yet.');
+            cell.colSpan = 6;
+            cell.className = 'empty-state';
+            row.appendChild(cell);
+            elements.activity.appendChild(row);
             return;
         }
 
-        // Update log count display
-        if (logCountDisplay) {
-            logCountDisplay.textContent = logs.length;
+        const fragment = document.createDocumentFragment();
+        logs.slice(0, 50).forEach((log) => {
+            const row = document.createElement('tr');
+            row.append(
+                textCell(new Date(log.timestamp).toLocaleString()),
+                textCell(log.ip),
+                textCell(log.userAgent),
+                textCell(log.path),
+                textCell(log.attackType),
+                detailCell(log)
+            );
+            fragment.appendChild(row);
+        });
+        elements.activity.appendChild(fragment);
+    }
+
+    // Count and rank one event field
+    function countBy(logs, field) {
+        const counts = new Map();
+        logs.forEach((log) => {
+            const key = String(log[field] || 'Unknown');
+            counts.set(key, (counts.get(key) || 0) + 1);
+        });
+        return [...counts.entries()].sort((left, right) => right[1] - left[1]);
+    }
+
+    // Render a compact frequency table
+    function renderCountTable(element, entries, limit = 10) {
+        clear(element);
+        if (entries.length === 0) {
+            const row = document.createElement('tr');
+            const cell = textCell('No data yet.');
+            cell.colSpan = 2;
+            cell.className = 'empty-state';
+            row.appendChild(cell);
+            element.appendChild(row);
+            return;
         }
+        const fragment = document.createDocumentFragment();
+        entries.slice(0, limit).forEach(([value, count]) => {
+            const row = document.createElement('tr');
+            row.append(textCell(value), textCell(count));
+            fragment.appendChild(row);
+        });
+        element.appendChild(fragment);
+    }
 
-        // Populate Recent Activity Log
-        if (attackLogBody) {
-            let logHtml = '';
-            logs.slice(0, 50).forEach(log => { // Display max 50 recent logs
-                const safeQuery = sanitize(decodeHtmlEntities(log.rawQuery));
-                const safeBody = sanitize(decodeHtmlEntities(log.bodySnippet));
-                logHtml += `
-                    <tr>
-                        <td>${sanitize(new Date(log.timestamp).toLocaleString())}</td>
-                        <td>${sanitize(log.ip)}</td>
-                        <td>${sanitize(log.userAgent)}</td>
-                        <td>${sanitize(log.path)}</td>
-                        <td>${sanitize(log.attackType)}</td>
-                        <td>${sanitize(log.details)}<br><small><em>Query: ${safeQuery}</em></small><br><small><em>Body: ${safeBody}</em></small></td>
-                    </tr>
-                `;
-            });
-            updateTableBody(attackLogBody, logHtml);
-        }
-        
-        // Aggregate data for Top IPs, UAs, Keywords
-        const ipCounts = {};
-        const uaCounts = {};
-        const keywordCounts = {};
-
-        logs.forEach(log => {
-            ipCounts[log.ip] = (ipCounts[log.ip] || 0) + 1;
-            uaCounts[log.userAgent] = (uaCounts[log.userAgent] || 0) + 1;
-
-            // Extract keywords from details, query, and body snippet
-            const textToAnalyze = `${log.details} ${log.rawQuery} ${log.bodySnippet}`;
-            const words = textToAnalyze.toLowerCase().match(/\b[a-z0-9]{3,}\b/g) || []; // Basic word extraction
-            // Filter out common words or numbers if desired
-            const commonWords = new Set(['the', 'and', 'for', 'com', 'http', 'https', 'www', 'api', 'xml', 'version', 'true', 'false', 'null', 'content', 'type', 'user', 'admin', 'select', 'from', 'where']);
-            words.forEach(word => {
-                if (!commonWords.has(word) && isNaN(word)) { // Avoid pure numbers and common words
-                    keywordCounts[word] = (keywordCounts[word] || 0) + 1;
+    // Extract a small vocabulary from captured payloads
+    function extractKeywords(logs) {
+        const ignored = new Set([
+            'the', 'and', 'for', 'com', 'http', 'https', 'www', 'api', 'xml',
+            'true', 'false', 'null', 'content', 'type', 'user', 'admin',
+            'select', 'from', 'where', 'detected', 'pattern'
+        ]);
+        const counts = new Map();
+        logs.forEach((log) => {
+            const text = `${log.details ?? ''} ${log.rawQuery ?? ''} ${log.bodySnippet ?? ''}`;
+            const words = text.toLowerCase().match(/\b[a-z0-9]{3,}\b/g) || [];
+            words.forEach((word) => {
+                if (!ignored.has(word) && Number.isNaN(Number(word))) {
+                    counts.set(word, (counts.get(word) || 0) + 1);
                 }
             });
         });
+        return [...counts.entries()].sort((left, right) => right[1] - left[1]);
+    }
 
-        // Populate Top Attacking IPs
-        if (topIpsBody) {
-            populateTopTable(topIpsBody, ipCounts, 10);
+    // Render keywords through textContent
+    function renderKeywords(entries) {
+        clear(elements.keywords);
+        if (entries.length === 0) {
+            const item = document.createElement('li');
+            item.className = 'empty-state';
+            item.textContent = 'No data yet.';
+            elements.keywords.appendChild(item);
+            return;
         }
-        if (ipOriginsList) { // Also use ipCounts for the map list
-            populateIpOriginsList(ipOriginsList, ipCounts, 10);
+        const fragment = document.createDocumentFragment();
+        entries.slice(0, 15).forEach(([keyword, count]) => {
+            const item = document.createElement('li');
+            item.textContent = `${keyword} (${count})`;
+            fragment.appendChild(item);
+        });
+        elements.keywords.appendChild(fragment);
+    }
+
+    // Refresh every panel from one API snapshot
+    function renderDashboard(logs) {
+        elements.count.textContent = String(logs.length);
+        renderActivity(logs);
+        renderCountTable(elements.topIps, countBy(logs, 'ip'));
+        renderCountTable(elements.topUas, countBy(logs, 'userAgent'));
+        renderCountTable(elements.attackTypes, countBy(logs, 'attackType'));
+        renderKeywords(extractKeywords(logs));
+    }
+
+    // Surface polling failures without clearing existing data
+    function setConnectionStatus(message, failed = false) {
+        elements.status.textContent = message;
+        elements.status.classList.toggle('status-error', failed);
+    }
+
+    // Avoid overlapping polls and reject malformed responses
+    async function fetchData() {
+        if (fetchInProgress) {
+            return;
         }
-
-
-        // Populate Top User Agents
-        if (topUasBody) {
-            populateTopTable(topUasBody, uaCounts, 10);
-        }
-
-        // Populate Common Payload Keywords
-        if (keywordsList) {
-            const sortedKeywords = Object.entries(keywordCounts)
-                .sort(([,a],[,b]) => b - a)
-                .slice(0, 15); // Top 15 keywords
-            let keywordsHtml = '';
-            sortedKeywords.forEach(([keyword, count]) => {
-                keywordsHtml += `<li>${sanitize(keyword)} (${count})</li>`;
+        fetchInProgress = true;
+        const controller = new AbortController();
+        const timeout = window.setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+        try {
+            const response = await fetch(API_ENDPOINT, {
+                cache: 'no-store',
+                signal: controller.signal
             });
-            updateList(keywordsList, keywordsHtml);
+            if (!response.ok) {
+                throw new Error(`HTTP ${response.status}`);
+            }
+            const logs = await response.json();
+            if (!Array.isArray(logs)) {
+                throw new Error('Unexpected API response');
+            }
+            renderDashboard(logs);
+            setConnectionStatus(`Live · ${new Date().toLocaleTimeString()}`);
+        } catch (error) {
+            console.error('Dashboard refresh failed:', error);
+            setConnectionStatus('Refresh failed', true);
+        } finally {
+            window.clearTimeout(timeout);
+            fetchInProgress = false;
         }
     }
 
-    function populateTopTable(tbodyElement, counts, limit) {
-        const sortedEntries = Object.entries(counts)
-            .sort(([,a],[,b]) => b - a)
-            .slice(0, limit);
-        
-        let tableHtml = '';
-        sortedEntries.forEach(([key, count]) => {
-            tableHtml += `<tr><td>${sanitize(key)}</td><td>${count}</td></tr>`;
-        });
-        updateTableBody(tbodyElement, tableHtml);
-    }
-    
-    function populateIpOriginsList(ulElement, ipCounts, limit) {
-        const sortedEntries = Object.entries(ipCounts)
-            .sort(([,a],[,b]) => b - a)
-            .slice(0, limit); // Top N IPs
-        let listHtml = '';
-        sortedEntries.forEach(([ip, count]) => {
-            // Placeholder for actual geolocation. For now, just list IP and count
-            listHtml += `<li>${sanitize(ip)} (Count: ${count}) - Origin: Unknown (Placeholder)</li>`;
-        });
-        updateList(ulElement, listHtml);
-    }
-
-
-    // Initial fetch and set interval for updates
+    // Fetch once now, then poll at a low fixed rate
     fetchData();
-    setInterval(fetchData, FETCH_INTERVAL);
+    window.setInterval(fetchData, FETCH_INTERVAL_MS);
 });

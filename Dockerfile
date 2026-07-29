@@ -1,37 +1,32 @@
-# Stage 1: Build the Go application
-ARG GO_VERSION=1.24.3
+# syntax=docker/dockerfile:1
+
+# Build with the Go version declared by the module
+ARG GO_VERSION=1.26.5
 FROM golang:${GO_VERSION}-alpine AS builder
 
-WORKDIR /app
+WORKDIR /src
 
-# Copy go.mod and go.sum files to leverage Docker cache
+# Cache dependencies before copying source
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 
-# Copy the rest of the application source code
-COPY . .
-
-# Build the Go application as a static binary
-# -ldflags="-w -s" strips debug information and symbol table, reducing binary size
-# CGO_ENABLED=0 ensures a static binary without C dependencies
-RUN CGO_ENABLED=0 GOOS=linux go build -v -a -installsuffix cgo -ldflags="-w -s" -o /ghoney-server main.go
-
-# Stage 2: Create the final minimal image
-FROM gcr.io/distroless/base-debian12 AS final
-
-# Set a non-root user
-USER nonroot:nonroot
-
-WORKDIR /app
-
-# Copy the static binary from the builder stage
-COPY --from=builder /ghoney-server /ghoney-server
-
-# Copy static assets for the dashboard
+# Embed static assets in the binary
+COPY main.go ./
 COPY static ./static
+RUN CGO_ENABLED=0 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /out/ghoney \
+    .
 
-# Expose the port the app runs on (honeypot and dashboard share this port inside container)
-EXPOSE 8080
+# Ship only the static binary
+FROM gcr.io/distroless/static-debian12:nonroot
 
-# Command to run the application
-CMD ["/ghoney-server"]
+COPY --from=builder --chown=nonroot:nonroot /out/ghoney /ghoney
+
+# Bind the admin listener to the container interface for port publishing
+ENV GHONEY_ADMIN_ADDR=:9090
+
+EXPOSE 8080 9090
+
+ENTRYPOINT ["/ghoney"]

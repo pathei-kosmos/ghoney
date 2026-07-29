@@ -1,0 +1,132 @@
+name: CI
+
+on:
+  push:
+    branches: ["master"]
+  pull_request:
+
+# Read access is sufficient for this workflow
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Check formatting
+        shell: bash
+        run: |
+          # List files before failing the formatting check
+          unformatted="$(git ls-files -z '*.go' | xargs -0 --no-run-if-empty gofmt -l)"
+          test -z "$unformatted" || { printf '%s\n' "$unformatted"; exit 1; }
+
+      - name: Run focused tests with race detection
+        run: go test -race ./...
+
+      - name: Run static analysis
+        run: go vet ./...
+
+      - name: Build hardened image
+        run: docker build -t ghoney:ci .
+
+      - name: Smoke test standard Docker isolation
+        shell: bash
+        run: |
+          # Cleanup also runs after failed assertions
+          cleanup() { docker rm -f ghoney-ci >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          docker run -d --name ghoney-ci \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges \
+            --read-only \
+            --memory=128m \
+            --cpus=1 \
+            --pids-limit=64 \
+            -p 18080:8080 \
+            -p 127.0.0.1:19090:9090 \
+            ghoney:ci
+
+          curl --retry 20 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:19090/health
+          curl --fail http://127.0.0.1:18080/admin >/dev/null
+          curl --fail http://127.0.0.1:19090/dashboard >/dev/null
+          curl --fail http://127.0.0.1:19090/metrics | grep -q ghoney_http_requests_total
+
+          # Keep the dashboard off the public listener
+          test "$(curl --output /dev/null --silent --write-out '%{http_code}' http://127.0.0.1:18080/dashboard)" = "404"
+
+      - name: Smoke test the custom seccomp profile
+        shell: bash
+        run: |
+          # Check the allowlist with runc before runsc
+          cleanup() { docker rm -f ghoney-seccomp >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          docker run -d --name ghoney-seccomp \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges \
+            --security-opt seccomp="$PWD/seccomp.json" \
+            --read-only \
+            --memory=128m \
+            --cpus=1 \
+            --pids-limit=64 \
+            -p 18080:8080 \
+            -p 127.0.0.1:19090:9090 \
+            ghoney:ci
+
+          curl --retry 20 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:19090/health
+          curl --fail --request POST http://127.0.0.1:18080/api/v1/auth \
+            --header "Content-Type: application/x-www-form-urlencoded" \
+            --data "u=' OR 1=1 --" >/dev/null
+          curl --fail http://127.0.0.1:19090/metrics | grep -q ghoney_honeypot_attacks_total
+
+      - name: Install gVisor
+        shell: bash
+        run: |
+          # Install runsc from its signed upstream repository
+          sudo apt-get update
+          sudo apt-get install -y ca-certificates curl gnupg
+          curl -fsSL https://gvisor.dev/archive.key \
+            | sudo gpg --dearmor --yes -o /usr/share/keyrings/gvisor-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/gvisor-archive-keyring.gpg] https://storage.googleapis.com/gvisor/releases release main" \
+            | sudo tee /etc/apt/sources.list.d/gvisor.list >/dev/null
+          sudo apt-get update
+          sudo apt-get install -y runsc
+          sudo systemctl restart docker
+          docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'
+          docker run --rm --runtime=runsc hello-world
+
+      - name: Smoke test gVisor with custom seccomp
+        shell: bash
+        run: |
+          # Run the documented runsc and Seccomp combination
+          cleanup() { docker rm -f ghoney-runsc >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+
+          docker run -d --name ghoney-runsc \
+            --runtime=runsc \
+            --cap-drop=ALL \
+            --security-opt no-new-privileges \
+            --security-opt seccomp="$PWD/seccomp.json" \
+            --read-only \
+            --memory=128m \
+            --cpus=1 \
+            --pids-limit=64 \
+            -p 18080:8080 \
+            -p 127.0.0.1:19090:9090 \
+            ghoney:ci
+
+          curl --retry 20 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:19090/health
+          curl --fail http://127.0.0.1:18080/.git/config >/dev/null

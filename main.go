@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"embed"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -13,34 +16,51 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"os/signal"
 	"regexp"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
 const (
-	serverPort         = "8080"
-	maxRequestBodySize = 4 * 1024 // 4KB
-	requestTimeout     = 5 * time.Second
-	logBufferSize      = 100
-	cookieName         = "X-Ghoney-Trap"
-	asciiArtBanner     = `
-       _                            
-  __ _| |__   ___  _ __   ___ _   _ 
+	defaultPublicAddr   = ":8080"
+	defaultAdminAddr    = "127.0.0.1:9090"
+	maxRequestBodySize  = 4 * 1024
+	maxBodySnippetSize  = 256
+	maxEventFieldSize   = 1024
+	maxHeaderBytes      = 16 * 1024
+	requestTimeout      = 5 * time.Second
+	shutdownTimeout     = 5 * time.Second
+	logBufferSize       = 100
+	maxConcurrentPublic = 128
+	envPublicAddr       = "GHONEY_ADDR"
+	envAdminAddr        = "GHONEY_ADMIN_ADDR"
+	unknownMetricRoute  = "not_found"
+	unknownMetricMethod = "OTHER"
+	asciiArtBanner      = `
+       _
+  __ _| |__   ___  _ __   ___ _   _
  / _` + "`" + ` | '_ \ / _ \| '_ \ / _ \ | | |
 | (_| | | | | (_) | | | |  __/ |_| |
  \__, |_| |_|\___/|_| |_|\___|\__, |
- |___/                        |___/ 
- 
+ |___/                        |___/
+
 `
 )
 
-// LogEntry stores information about a request for the dashboard
+// Ship static assets inside the binary
+//
+//go:embed static/*
+var staticAssets embed.FS
+
+// LogEntry is the bounded event shape exposed to the dashboard
 type LogEntry struct {
 	Timestamp   time.Time `json:"timestamp"`
 	IP          string    `json:"ip"`
@@ -52,112 +72,117 @@ type LogEntry struct {
 	BodySnippet string    `json:"bodySnippet"`
 }
 
+// loggingResponseWriter tracks the first status written by a handler
+type loggingResponseWriter struct {
+	http.ResponseWriter
+	statusCode  int
+	wroteHeader bool
+}
+
 var (
 	recentLogs []LogEntry
 	logMutex   sync.Mutex
-	seededRand *PRNG // For crypto-seeded random numbers
 
-	httpRequestsTotal = promauto.NewCounterVec(
+	metricsRegistry   = prometheus.NewRegistry()
+	httpRequestsTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "ghoney_http_requests_total",
-			Help: "Total HTTP requests.",
+			Help: "Total HTTP requests grouped by bounded route, method, and status.",
 		},
-		[]string{"path", "method", "status"},
+		[]string{"route", "method", "status"},
 	)
-	honeypotAttacksTotal = promauto.NewCounterVec(
+	honeypotAttacksTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "ghoney_honeypot_attacks_total",
-			Help: "Total detected honeypot attacks.",
+			Help: "Total detected honeypot attacks grouped by bounded type and route.",
 		},
-		[]string{"attack_type", "path"},
+		[]string{"attack_type", "route"},
 	)
 
-	// Precompiled regex for attack detection
-	sqlRegex      = regexp.MustCompile(`(?i)('|\")(?:--|#|\s*(?:OR|AND)\s+(?:\d+|'[^']*'|\"[^\"]*\")\s*=\s*(?:\d+|'[^']*'|\"[^\"]*\"))`)
+	// Compile signatures once outside the request path
+	sqlRegex       = regexp.MustCompile(`(?i)('|\")(?:--|#|\s*(?:OR|AND)\s+(?:\d+|'[^']*'|\"[^\"]*\")\s*=\s*(?:\d+|'[^']*'|\"[^\"]*\"))`)
 	sqliExtraRegex = regexp.MustCompile(`(?i)\bunion\s+select\b|\bsleep\s*\(|\bbenchmark\s*\(|\bwaitfor\s+delay\b`)
-	xmlBombRegex  = regexp.MustCompile(`(?i)<!ENTITY\s+\S+\s+SYSTEM`)
-	cmdiRegex     = regexp.MustCompile("(?i)(?:;|\\|\\||&&|\\$\\(|`)[^\\n]{0,100}(?:whoami|id|uname|cat|curl|wget|ping)")
+	xmlBombRegex   = regexp.MustCompile(`(?i)<!ENTITY\s+\S+\s+SYSTEM`)
+	cmdiRegex      = regexp.MustCompile("(?i)(?:;|\\|\\||&&|\\$\\(|`)[^\\n]{0,100}(?:whoami|id|uname|cat|curl|wget|ping)")
 	ssrfParamRegex = regexp.MustCompile(`(?i)(?:\burl\b|\buri\b|\bredirect\b|\bnext\b|\btarget\b|\bdest\b|\bdestination\b)\s*=\s*https?://`)
 	ssrfHostRegex  = regexp.MustCompile(`(?i)\b169\.254\.169\.254\b|\blocalhost\b|\b127\.0\.0\.1\b|\b0\.0\.0\.0\b|\b10\.\d{1,3}\.\d{1,3}\.\d{1,3}\b|\b192\.168\.\d{1,3}\.\d{1,3}\b|\b172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3}\b`)
-	lfiRegex      = regexp.MustCompile(`(?i)/etc/passwd|/proc/self/environ|\bphp://|\bfile://|\bdata:`)
+	lfiRegex       = regexp.MustCompile(`(?i)/etc/passwd|/proc/self/environ|\bphp://|\bfile://|\bdata:`)
 )
 
-// PRNG uses crypto/rand for better non-determinism in delays
-type PRNG struct{}
-
-func (r *PRNG) Intn(max int) int {
-	if max <= 0 {
-		return 0
-	}
-	n, err := rand.Int(rand.Reader, big.NewInt(int64(max)))
-	if err != nil {
-		log.Printf("level=error ts=%s msg=\"crypto/rand error for delay, fallback\" error=\"%v\"\n", time.Now().UTC().Format(time.RFC3339), err)
-		return int(time.Now().UnixNano() % int64(max))
-	}
-	return int(n.Int64())
-}
-
+// Keep standard log output aligned with the logfmt records
 func init() {
-	seededRand = &PRNG{}
-	log.SetFlags(0) // Disable standard log prefixes for logfmt
+	log.SetFlags(0)
+	metricsRegistry.MustRegister(httpRequestsTotal, honeypotAttacksTotal)
 }
 
-// logEvent records an event in logfmt to stdout and stores critical ones for the dashboard
+// Repair UTF-8 before enforcing the byte cap
+func truncateUTF8(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	value = strings.ToValidUTF8(value, "\uFFFD")
+	if len(value) <= limit {
+		return value
+	}
+	value = value[:limit]
+	for len(value) > 0 && !utf8.ValidString(value) {
+		value = value[:len(value)-1]
+	}
+	return value
+}
+
+// Emit logfmt and retain only bounded dashboard events
 func logEvent(level, ip, userAgent, path, attackType, details, rawQuery, bodySnippet string) {
-	sanitize := func(s string) string {
-		s = strings.ReplaceAll(s, "\"", "'")
-		s = strings.ReplaceAll(s, "\n", " ")
-		s = strings.ReplaceAll(s, "\r", " ")
-		return s
+	entry := LogEntry{
+		Timestamp:   time.Now().UTC(),
+		IP:          truncateUTF8(ip, maxEventFieldSize),
+		UserAgent:   truncateUTF8(userAgent, maxEventFieldSize),
+		Path:        truncateUTF8(path, maxEventFieldSize),
+		AttackType:  truncateUTF8(attackType, maxEventFieldSize),
+		Details:     truncateUTF8(details, maxEventFieldSize),
+		RawQuery:    truncateUTF8(rawQuery, maxEventFieldSize),
+		BodySnippet: truncateUTF8(bodySnippet, maxBodySnippetSize),
 	}
 
-	// Log to stdout in logfmt
-	fmt.Printf("level=%s ts=%s ip=\"%s\" ua=\"%s\" path=\"%s\" attack_type=\"%s\" details=\"%s\" query=\"%s\" body_snippet=\"%s\"\n",
+	fmt.Printf("level=%s ts=%s ip=%q ua=%q path=%q attack_type=%q details=%q query=%q body_snippet=%q\n",
 		level,
-		time.Now().UTC().Format(time.RFC3339),
-		sanitize(ip),
-		sanitize(userAgent),
-		sanitize(path),
-		sanitize(attackType),
-		sanitize(details),
-		sanitize(rawQuery),
-		sanitize(bodySnippet),
+		entry.Timestamp.Format(time.RFC3339),
+		entry.IP,
+		entry.UserAgent,
+		entry.Path,
+		entry.AttackType,
+		entry.Details,
+		entry.RawQuery,
+		entry.BodySnippet,
 	)
 
-	// Store for dashboard if it's a warning (attack) or specific info (honeypot access)
-	isHoneypotAccess := path == "/admin" || path == "/api/v1/auth" || path == "/.git/config"
-	if level == "warn" || (level == "info" && isHoneypotAccess) {
-		logMutex.Lock()
-		defer logMutex.Unlock()
-
-		entry := LogEntry{
-			Timestamp:   time.Now().UTC(),
-			IP:          ip,
-			UserAgent:   userAgent,
-			Path:        path,
-			AttackType:  attackType,
-			Details:     details,
-			RawQuery:    rawQuery,
-			BodySnippet: bodySnippet, // Already escaped if it came from middleware
-		}
-		recentLogs = append(recentLogs, entry)
-		if len(recentLogs) > logBufferSize {
-			recentLogs = recentLogs[len(recentLogs)-logBufferSize:]
-		}
+	if level != "warn" && attackType != "HoneypotAccess" {
+		return
 	}
+
+	logMutex.Lock()
+	defer logMutex.Unlock()
+	if len(recentLogs) < logBufferSize {
+		recentLogs = append(recentLogs, entry)
+		return
+	}
+	copy(recentLogs, recentLogs[1:])
+	recentLogs[len(recentLogs)-1] = entry
 }
 
-// Middleware: Adds security headers
+// Apply the shared browser security policy
 func securityHeadersMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("Referrer-Policy", "no-referrer")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
-		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:;")
 		next.ServeHTTP(w, r)
 	})
 }
 
-// Middleware: Enforces request timeout
+// Attach the deadline used by delayed handlers
 func timeoutMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), requestTimeout)
@@ -166,279 +191,454 @@ func timeoutMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-// Middleware: Logs requests, sets trap cookie, detects basic attacks
-func requestLogAndTrapMiddleware(next http.Handler) http.Handler {
+// Cap public work, including delayed responses
+func concurrencyLimitMiddleware(limit int, next http.Handler) http.Handler {
+	slots := make(chan struct{}, limit)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		startTime := time.Now()
-		clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-		userAgent := r.UserAgent()
-		path := r.URL.Path
-		rawQuery := r.URL.RawQuery // Keep raw query for logging
-
-		if _, err := r.Cookie(cookieName); err != nil {
-			http.SetCookie(w, &http.Cookie{
-				Name: cookieName, Value: "1", Path: "/", HttpOnly: true,
-				Secure: r.TLS != nil, SameSite: http.SameSiteLaxMode,
-			})
+		select {
+		case slots <- struct{}{}:
+			defer func() { <-slots }()
+			next.ServeHTTP(w, r)
+		default:
+			http.Error(w, "Service Unavailable", http.StatusServiceUnavailable)
 		}
-
-		var bodyBytes []byte
-		var bodySnippet string
-		if r.Body != nil {
-			if r.ContentLength < 0 {
-				var err error
-				bodyBytes, err = io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize+1))
-				if err != nil {
-					fmt.Printf("level=error ts=%s ip=\"%s\" msg=\"BodyReadError\" path=\"%s\" error=\"%v\"\n",
-						time.Now().UTC().Format(time.RFC3339), clientIP, path, err)
-				}
-				if len(bodyBytes) > maxRequestBodySize {
-					logEvent("warn", clientIP, userAgent, path, "LargeBody",
-						fmt.Sprintf("Body size > %d", maxRequestBodySize), rawQuery, "")
-					http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
-					httpRequestsTotal.WithLabelValues(path, r.Method, fmt.Sprintf("%d", http.StatusRequestEntityTooLarge)).Inc()
-					return
-				}
-				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
-				if len(bodyBytes) > 256 {
-					bodySnippet = string(bodyBytes[:256])
-				} else {
-					bodySnippet = string(bodyBytes)
-				}
-			}
-		}
-		if r.Body != nil && r.ContentLength > 0 {
-			if r.ContentLength > maxRequestBodySize {
-				logEvent("warn", clientIP, userAgent, path, "LargeBody",
-					fmt.Sprintf("Body size %d > %d", r.ContentLength, maxRequestBodySize), rawQuery, "")
-				http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
-				httpRequestsTotal.WithLabelValues(path, r.Method, fmt.Sprintf("%d", http.StatusRequestEntityTooLarge)).Inc()
-				return
-			}
-			var err error
-			bodyBytes, err = io.ReadAll(r.Body) // Read the body
-			if err != nil {
-				// Log error, but continue
-				fmt.Printf("level=error ts=%s ip=\"%s\" msg=\"BodyReadError\" path=\"%s\" error=\"%v\"\n",
-					time.Now().UTC().Format(time.RFC3339), clientIP, path, err)
-			} else {
-				r.Body = io.NopCloser(bytes.NewBuffer(bodyBytes)) // Restore body for next handler
-				// Create bodySnippet from bodyBytes, not the potentially modified body string
-				if len(bodyBytes) > 256 {
-					bodySnippet = string(bodyBytes[:256])
-				} else {
-					bodySnippet = string(bodyBytes)
-				}
-			}
-		}
-
-		attackType := "None"
-		details := ""
-
-		normalizeForDetection := func(s string) string {
-			if s == "" {
-				return ""
-			}
-			out := strings.ReplaceAll(s, "+", " ")
-			for i := 0; i < 2; i++ {
-				u, err := url.QueryUnescape(out)
-				if err != nil {
-					break
-				}
-				out = u
-			}
-			out = html.UnescapeString(out)
-			out = strings.ToLower(out)
-			out = strings.Join(strings.Fields(out), " ")
-			return out
-		}
-
-		normalized := normalizeForDetection(path + " " + rawQuery + " " + bodySnippet)
-
-		// Path Traversal (checks path, query, body)
-		if strings.Contains(normalized, "../") || strings.Contains(normalized, "..\\") {
-			attackType = "Path Traversal"
-			details = "Detected '../' in path, query, or body"
-		}
-
-		// SQL Injection (checks query and body snippet)
-		// Ensure attackType is not overwritten if Path Traversal was already found
-		if attackType == "None" && (sqlRegex.MatchString(normalized) || sqliExtraRegex.MatchString(normalized)) {
-			attackType = "SQL Injection"
-			details = "Detected SQLi pattern in query or body"
-		}
-
-		// XML Bomb (checks body snippet)
-		// Ensure attackType is not overwritten
-		if attackType == "None" && bodySnippet != "" && xmlBombRegex.MatchString(normalized) {
-			attackType = "XML Bomb"
-			details = "Detected XML bomb pattern in body"
-		}
-		
-		// Command Injection
-		if attackType == "None" && cmdiRegex.MatchString(normalized) {
-			attackType = "Command Injection"
-			details = "Detected command injection pattern"
-		}
-		
-		// SSRF
-		if attackType == "None" && (ssrfHostRegex.MatchString(normalized) && ssrfParamRegex.MatchString(normalized)) {
-			attackType = "SSRF"
-			details = "Detected SSRF pattern"
-		}
-		
-		// LFI/RFI
-		if attackType == "None" && lfiRegex.MatchString(normalized) {
-			attackType = "LFI/RFI"
-			details = "Detected local/remote file inclusion pattern"
-		}
-
-		// Logging based on detection or honeypot access
-		isHoneypotPath := path == "/admin" || path == "/api/v1/auth" || path == "/.git/config"
-		if attackType != "None" {
-			honeypotAttacksTotal.WithLabelValues(attackType, path).Inc()
-			// Body snippet for logging should be HTML escaped to prevent XSS in log viewers / dashboard
-			logEvent("warn", clientIP, userAgent, path, attackType, details, rawQuery, html.EscapeString(bodySnippet))
-		} else if isHoneypotPath {
-			// Log access to honeypot paths if no specific attack was detected on them
-			logEvent("info", clientIP, userAgent, path, "HoneypotAccess", "Accessed honeypot endpoint", rawQuery, html.EscapeString(bodySnippet))
-		}
-		// Note: Generic "NotFound" logs are handled by the handleNotFound catch-all for paths not triggering above
-
-		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
-		next.ServeHTTP(lrw, r) // Serve the request
-
-		httpRequestsTotal.WithLabelValues(path, r.Method, fmt.Sprintf("%d", lrw.statusCode)).Inc()
-		_ = startTime // Suppress unused variable if not logging duration
 	})
 }
 
-type loggingResponseWriter struct {
-	http.ResponseWriter
-	statusCode int
+// Record metrics with a fixed label set
+func metricsMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writer := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		next.ServeHTTP(writer, r)
+		httpRequestsTotal.WithLabelValues(
+			metricRoute(r.URL.Path),
+			metricMethod(r.Method),
+			fmt.Sprintf("%d", writer.statusCode),
+		).Inc()
+	})
 }
 
-func (lrw *loggingResponseWriter) WriteHeader(code int) {
-	lrw.statusCode = code
-	lrw.ResponseWriter.WriteHeader(code)
+// Buffer and classify each public request body once
+func requestInspectionMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		clientIP := remoteIP(r.RemoteAddr)
+		body, err := readBoundedBody(w, r)
+		if err != nil {
+			status := http.StatusBadRequest
+			attackType := "MalformedBody"
+			details := "Failed to read request body"
+			var maxBytesError *http.MaxBytesError
+			if errors.As(err, &maxBytesError) {
+				status = http.StatusRequestEntityTooLarge
+				attackType = "LargeBody"
+				details = fmt.Sprintf("Body size exceeds %d bytes", maxRequestBodySize)
+			}
+			logEvent("warn", clientIP, r.UserAgent(), r.URL.Path, attackType, details, r.URL.RawQuery, "")
+			http.Error(w, http.StatusText(status), status)
+			return
+		}
+
+		attackType, details := detectAttack(r.URL.Path, r.URL.RawQuery, string(body))
+		if attackType != "" {
+			route := metricRoute(r.URL.Path)
+			honeypotAttacksTotal.WithLabelValues(attackType, route).Inc()
+			logEvent("warn", clientIP, r.UserAgent(), r.URL.Path, attackType, details, r.URL.RawQuery, string(body))
+		} else if isHoneypotPath(r.URL.Path) {
+			logEvent("info", clientIP, r.UserAgent(), r.URL.Path, "HoneypotAccess", "Accessed honeypot endpoint", r.URL.RawQuery, string(body))
+		}
+
+		next.ServeHTTP(w, r)
+	})
 }
 
-func applyRandomDelay() {
-	delay := time.Duration(seededRand.Intn(2000)+1000) * time.Millisecond // 1-3 seconds
-	time.Sleep(delay)
+// Apply the same body cap to fixed and streamed requests
+func readBoundedBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
+	if r.Body == nil || r.Body == http.NoBody {
+		return nil, nil
+	}
+	boundedBody := http.MaxBytesReader(w, r.Body, maxRequestBodySize)
+	body, readErr := io.ReadAll(boundedBody)
+	closeErr := boundedBody.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close request body: %w", closeErr)
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return body, nil
 }
 
-func handleAdmin(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		applyRandomDelay()
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+// Return the first matching class after normalization
+func detectAttack(path, rawQuery, body string) (string, string) {
+	normalized := normalizeForDetection(path + " " + rawQuery + " " + body)
+	switch {
+	case strings.Contains(normalized, "../") || strings.Contains(normalized, `..\`):
+		return "Path Traversal", "Detected traversal sequence in path, query, or body"
+	case sqlRegex.MatchString(normalized) || sqliExtraRegex.MatchString(normalized):
+		return "SQL Injection", "Detected SQL injection pattern"
+	case body != "" && xmlBombRegex.MatchString(normalized):
+		return "XML Bomb", "Detected external XML entity pattern"
+	case cmdiRegex.MatchString(normalized):
+		return "Command Injection", "Detected command injection pattern"
+	case ssrfHostRegex.MatchString(normalized) && ssrfParamRegex.MatchString(normalized):
+		return "SSRF", "Detected internal target in URL parameter"
+	case lfiRegex.MatchString(normalized):
+		return "LFI/RFI", "Detected local or remote file inclusion pattern"
+	default:
+		return "", ""
+	}
+}
+
+// Decode common scanner obfuscation before matching
+func normalizeForDetection(value string) string {
+	if value == "" {
+		return ""
+	}
+	value = strings.ReplaceAll(value, "+", " ")
+	for range 2 {
+		decoded, err := url.QueryUnescape(value)
+		if err != nil {
+			break
+		}
+		value = decoded
+	}
+	value = html.UnescapeString(value)
+	value = strings.ToLower(value)
+	return strings.Join(strings.Fields(value), " ")
+}
+
+// Use the socket peer instead of forwarding headers
+func remoteIP(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+// Match the public decoy routes
+func isHoneypotPath(path string) bool {
+	return path == "/admin" || path == "/api/v1/auth" || path == "/.git/config"
+}
+
+// Collapse paths into a fixed Prometheus label set
+func metricRoute(path string) string {
+	switch path {
+	case "/admin", "/api/v1/auth", "/.git/config", "/dashboard", "/api/dashboard-data", "/metrics", "/health":
+		return path
+	case "/static/admin.css", "/static/style.css", "/static/app.js":
+		return "/static/*"
+	default:
+		return unknownMetricRoute
+	}
+}
+
+// Collapse custom methods into one Prometheus series
+func metricMethod(method string) string {
+	switch method {
+	case http.MethodGet, http.MethodHead, http.MethodPost, http.MethodPut, http.MethodPatch,
+		http.MethodDelete, http.MethodOptions, http.MethodConnect, http.MethodTrace:
+		return method
+	default:
+		return unknownMetricMethod
+	}
+}
+
+// WriteHeader records the first status like net/http
+func (w *loggingResponseWriter) WriteHeader(code int) {
+	if w.wroteHeader {
 		return
 	}
-	http.ServeFile(w, r, "static/admin_login.html")
+	w.wroteHeader = true
+	w.statusCode = code
+	w.ResponseWriter.WriteHeader(code)
 }
 
+// Write records the implicit success status before the body
+func (w *loggingResponseWriter) Write(payload []byte) (int, error) {
+	if !w.wroteHeader {
+		w.WriteHeader(http.StatusOK)
+	}
+	return w.ResponseWriter.Write(payload)
+}
+
+// Unwrap exposes the underlying writer to http.ResponseController
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+// Delay for one to three seconds unless the request is cancelled
+func applyRandomDelay(ctx context.Context) bool {
+	delay, err := rand.Int(rand.Reader, big.NewInt(2000))
+	if err != nil {
+		log.Printf("level=error ts=%s msg=%q error=%q", time.Now().UTC().Format(time.RFC3339), "crypto/rand delay fallback", err.Error())
+		delay = big.NewInt(time.Now().UnixNano() % 2000)
+	}
+	timer := time.NewTimer(time.Duration(delay.Int64()+1000) * time.Millisecond)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+// Generate per-request bait instead of storing fake secrets
+func randomToken(prefix string, byteCount int) (string, error) {
+	payload := make([]byte, byteCount)
+	if _, err := rand.Read(payload); err != nil {
+		return "", fmt.Errorf("generate random token: %w", err)
+	}
+	return prefix + base64.RawURLEncoding.EncodeToString(payload), nil
+}
+
+// Build a short-lived decoy token with random signature bytes
+func newFakeJWT() (string, error) {
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"HS256","typ":"JWT"}`))
+	claims, err := json.Marshal(struct {
+		Subject string `json:"sub"`
+		Role    string `json:"role"`
+		Issuer  string `json:"iss"`
+		Issued  int64  `json:"iat"`
+		Expires int64  `json:"exp"`
+	}{
+		Subject: "administrator",
+		Role:    "admin",
+		Issuer:  "internal-auth",
+		Issued:  time.Now().Unix(),
+		Expires: time.Now().Add(15 * time.Minute).Unix(),
+	})
+	if err != nil {
+		return "", fmt.Errorf("encode fake JWT claims: %w", err)
+	}
+	signature, err := randomToken("", 32)
+	if err != nil {
+		return "", err
+	}
+	return header + "." + base64.RawURLEncoding.EncodeToString(claims) + "." + signature, nil
+}
+
+// Serve the public administrator decoy
+func handleAdmin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowedWithDelay(w, r, http.MethodGet)
+		return
+	}
+	http.ServeFileFS(w, r, staticAssets, "static/admin_login.html")
+}
+
+// Return a fresh fake token for each login attempt
 func handleAPIV1Auth(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
-		applyRandomDelay()
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		methodNotAllowedWithDelay(w, r, http.MethodPost)
 		return
 	}
-	fakeJWT := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMiwiZXhwIjoxNTE2MjQyNjIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+	token, err := newFakeJWT()
+	if err != nil {
+		log.Printf("level=error ts=%s msg=%q error=%q", time.Now().UTC().Format(time.RFC3339), "fake token generation failed", err.Error())
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json")
-	fmt.Fprintf(w, `{"token": "%s", "status": "success"}`, fakeJWT)
+	if err := json.NewEncoder(w).Encode(map[string]string{"token": token, "status": "success"}); err != nil {
+		log.Printf("level=error ts=%s msg=%q error=%q", time.Now().UTC().Format(time.RFC3339), "fake auth response failed", err.Error())
+	}
 }
 
+// Serve generated Git bait under reserved example domains
 func handleGitConfig(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		applyRandomDelay()
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		methodNotAllowedWithDelay(w, r, http.MethodGet)
 		return
 	}
-	fakeConfig := `[core]
+	token, err := randomToken("glpat-", 15)
+	if err != nil {
+		log.Printf("level=error ts=%s msg=%q error=%q", time.Now().UTC().Format(time.RFC3339), "fake Git token generation failed", err.Error())
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if _, err := fmt.Fprintf(w, `[core]
 	repositoryformatversion = 0
 	filemode = true
 	bare = false
 [remote "origin"]
-	url = git@internal-git.example.com:corp/secret-project.git
-	# url = https://user:P@$$wOrd@internal-git.example.com/trap.git
+	url = git@internal-git.example.com:platform/control-plane.git
 	fetch = +refs/heads/*:refs/remotes/origin/*
-# FAKE_API_KEY_FOR_SCANNER = glpat-abcdef1234567890abcd (DO NOT USE)
-`
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8") // Corrected charset
-	io.WriteString(w, fakeConfig)
+[credential]
+	helper = store
+# CI_DEPLOY_TOKEN = %s
+`, token); err != nil {
+		log.Printf("level=error ts=%s msg=%q error=%q", time.Now().UTC().Format(time.RFC3339), "fake Git config response failed", err.Error())
+	}
 }
 
+// Copy dashboard events newest first before encoding
 func handleDashboardData(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", http.MethodGet)
+		http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+		return
+	}
 	logMutex.Lock()
-	// Create a copy and reverse for newest-first display
 	logsCopy := make([]LogEntry, len(recentLogs))
 	for i, j := 0, len(recentLogs)-1; i < len(recentLogs); i, j = i+1, j-1 {
 		logsCopy[i] = recentLogs[j]
 	}
 	logMutex.Unlock()
 
+	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Content-Type", "application/json")
 	if err := json.NewEncoder(w).Encode(logsCopy); err != nil {
-		fmt.Printf("level=error ts=%s msg=\"DashboardError - Failed to marshal logs\" error=\"%v\"\n",
-			time.Now().UTC().Format(time.RFC3339), err)
-		http.Error(w, "Failed to generate dashboard data", http.StatusInternalServerError)
+		log.Printf("level=error ts=%s msg=%q error=%q", time.Now().UTC().Format(time.RFC3339), "dashboard encoding failed", err.Error())
 	}
 }
 
-// handleNotFound is the catch-all for undefined paths that haven't triggered specific attack logic in middleware
+// Log unknown public traffic before the delayed 404
 func handleNotFound(w http.ResponseWriter, r *http.Request) {
-	clientIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-	userAgent := r.UserAgent()
-	rawQuery := r.URL.RawQuery
-
-	logEvent("info", clientIP, userAgent, r.URL.Path, "NotFound", "Access to undefined path", rawQuery, "")
-	applyRandomDelay()
+	logEvent("info", remoteIP(r.RemoteAddr), r.UserAgent(), r.URL.Path, "NotFound", "Accessed undefined path", r.URL.RawQuery, "")
+	if !applyRandomDelay(r.Context()) {
+		return
+	}
 	http.NotFound(w, r)
 }
 
-func main() {
-	fmt.Print(asciiArtBanner)
-	fmt.Printf("ghoney starting on port %s...\n", serverPort)
-	fmt.Printf("Honeypot endpoints: /admin, /api/v1/auth, /.git/config on http://localhost:%s (host mapping)\n", serverPort)
-	fmt.Printf("Dashboard: http://localhost:%s/dashboard\n", serverPort)
-	fmt.Printf("Metrics: http://localhost:%s/metrics\n", serverPort)
-	fmt.Printf("Health: http://localhost:%s/health\n", serverPort)
+// Delay unsupported methods on decoy routes
+func methodNotAllowedWithDelay(w http.ResponseWriter, r *http.Request, allowed string) {
+	if !applyRandomDelay(r.Context()) {
+		return
+	}
+	w.Header().Set("Allow", allowed)
+	http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+}
 
+// Serve one embedded asset with read-only methods
+func embeddedFileHandler(path string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			return
+		}
+		http.ServeFileFS(w, r, staticAssets, path)
+	}
+}
+
+// Assemble the public honeypot routes
+func publicHandler() http.Handler {
 	mux := http.NewServeMux()
-
-	fs := http.FileServer(http.Dir("./static"))
-	mux.Handle("/static/", http.StripPrefix("/static/", fs))
-	mux.HandleFunc("/dashboard", func(w http.ResponseWriter, r *http.Request) {
-		http.ServeFile(w, r, "static/dashboard.html")
-	})
-
-	mux.HandleFunc("/api/dashboard-data", handleDashboardData)
 	mux.HandleFunc("/admin", handleAdmin)
 	mux.HandleFunc("/api/v1/auth", handleAPIV1Auth)
 	mux.HandleFunc("/.git/config", handleGitConfig)
-
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintln(w, "OK")
-	})
-	mux.Handle("/metrics", promhttp.Handler())
-
+	mux.HandleFunc("/static/admin.css", embeddedFileHandler("static/admin.css"))
 	mux.HandleFunc("/", handleNotFound)
 
-	chainedHandler := timeoutMiddleware(securityHeadersMiddleware(requestLogAndTrapMiddleware(mux)))
+	handler := requestInspectionMiddleware(mux)
+	handler = concurrencyLimitMiddleware(maxConcurrentPublic, handler)
+	handler = metricsMiddleware(handler)
+	handler = timeoutMiddleware(handler)
+	return securityHeadersMiddleware(handler)
+}
 
-	server := &http.Server{
-		Addr:              ":" + serverPort,
-		Handler:           chainedHandler,
+// Assemble the operational routes for the admin listener
+func adminHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/dashboard", embeddedFileHandler("static/dashboard.html"))
+	mux.HandleFunc("/static/style.css", embeddedFileHandler("static/style.css"))
+	mux.HandleFunc("/static/app.js", embeddedFileHandler("static/app.js"))
+	mux.HandleFunc("/api/dashboard-data", handleDashboardData)
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", http.MethodGet)
+			http.Error(w, http.StatusText(http.StatusMethodNotAllowed), http.StatusMethodNotAllowed)
+			return
+		}
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		if _, err := io.WriteString(w, "OK\n"); err != nil {
+			log.Printf("level=error ts=%s msg=%q error=%q", time.Now().UTC().Format(time.RFC3339), "health response failed", err.Error())
+		}
+	})
+	mux.Handle("/metrics", promhttp.HandlerFor(metricsRegistry, promhttp.HandlerOpts{}))
+
+	handler := metricsMiddleware(mux)
+	handler = timeoutMiddleware(handler)
+	return securityHeadersMiddleware(handler)
+}
+
+// Apply the same transport limits to both listeners
+func newHTTPServer(address string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              address,
+		Handler:           handler,
 		ReadHeaderTimeout: 3 * time.Second,
-		ReadTimeout:       requestTimeout + (1 * time.Second),
-		WriteTimeout:      requestTimeout + (1 * time.Second),
+		ReadTimeout:       requestTimeout + time.Second,
+		WriteTimeout:      requestTimeout + time.Second,
 		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    maxHeaderBytes,
+	}
+}
+
+// Read an address override without accepting blank values
+func envOrDefault(name, fallback string) string {
+	if value := strings.TrimSpace(os.Getenv(name)); value != "" {
+		return value
+	}
+	return fallback
+}
+
+// Run both listeners and stop them together
+func run(ctx context.Context) error {
+	publicAddr := envOrDefault(envPublicAddr, defaultPublicAddr)
+	adminAddr := envOrDefault(envAdminAddr, defaultAdminAddr)
+	publicServer := newHTTPServer(publicAddr, publicHandler())
+	adminServer := newHTTPServer(adminAddr, adminHandler())
+	servers := []*http.Server{publicServer, adminServer}
+	errorsCh := make(chan error, len(servers))
+
+	for _, server := range servers {
+		server := server
+		go func() {
+			err := server.ListenAndServe()
+			if errors.Is(err, http.ErrServerClosed) {
+				err = nil
+			}
+			errorsCh <- err
+		}()
 	}
 
-	fmt.Printf("level=info ts=%s msg=\"ghoney server listening\" port=%s\n", time.Now().UTC().Format(time.RFC3339), serverPort)
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		log.Fatalf("level=fatal ts=%s msg=\"could not listen on port\" port=%s error=\"%v\"\n", time.Now().UTC().Format(time.RFC3339), serverPort, err)
+	fmt.Print(asciiArtBanner)
+	fmt.Printf("level=info ts=%s msg=%q public_addr=%q admin_addr=%q\n",
+		time.Now().UTC().Format(time.RFC3339),
+		"ghoney listening",
+		publicAddr,
+		adminAddr,
+	)
+
+	var runErr error
+	select {
+	case <-ctx.Done():
+	case runErr = <-errorsCh:
+		if runErr == nil {
+			runErr = errors.New("HTTP server stopped unexpectedly")
+		}
+	}
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	var shutdownErr error
+	for _, server := range servers {
+		shutdownErr = errors.Join(shutdownErr, server.Shutdown(shutdownCtx))
+	}
+	return errors.Join(runErr, shutdownErr)
+}
+
+// Tie server shutdown to process signals
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	if err := run(ctx); err != nil {
+		log.Fatalf("level=fatal ts=%s msg=%q error=%q", time.Now().UTC().Format(time.RFC3339), "server stopped", err.Error())
 	}
 }

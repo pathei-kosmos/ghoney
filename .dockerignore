@@ -1,0 +1,14 @@
+# Exclude files unused by the image build
+.git
+.github
+img
+*.md
+LICENSE
+seccomp.json
+
+# Exclude local tooling and build output
+.idea
+.vscode
+*.exe
+*.test
+coverage.out
