@@ -24,7 +24,8 @@
 
 ## ✨ What it catches
 
-- SQL injection, path traversal, command injection, SSRF, LFI/RFI, and XML entity payloads
+- SQL injection, path traversal, command injection, SSRF, LFI/RFI, and XML entity attacks
+- Encoded and obfuscated payloads across URLs, request bodies, and selected headers
 - Requests to decoy routes such as `/admin`, `/api/v1/auth`, and `/.git/config`
 
 Unknown routes respond with a cancellable random 1-3 second delay. Request bodies, logs, metrics labels, concurrency, and the in-memory event buffer are all bounded.
@@ -66,7 +67,7 @@ curl "http://localhost:8080/?url=http://169.254.169.254/latest/meta-data/"
 curl "http://localhost:8080/?file=php://filter/read=convert.base64-encode/resource=/etc/passwd"
 ```
 
-The authentication endpoint responds with `HTTP 200`. The other requests target the undefined `/` route and respond with `HTTP 404` after the intentional delay. All payloads are detected.
+The authentication endpoint responds with `HTTP 200`. The other requests target the undefined `/` route and respond with `HTTP 404` after the intentional delay. All payloads are detected, and mixed payloads generate one event per attack family.
 
 Review the events in the dashboard or from the command line:
 
