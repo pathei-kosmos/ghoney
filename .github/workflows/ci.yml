@@ -13,15 +13,19 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    strategy:
+      # Check the minimum and image build versions
+      matrix:
+        go-version: ["1.25.x", "1.26.7"]
 
     steps:
       - name: Check out source
         uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: ${{ matrix.go-version }}
           cache: true
           cache-dependency-path: go.sum
 
@@ -38,6 +42,15 @@ jobs:
       - name: Run static analysis
         run: go vet ./...
 
+  containers:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
       - name: Build hardened image
         run: docker build -t ghoney:ci .
 
@@ -47,8 +60,13 @@ jobs:
           # Cleanup also runs after failed assertions
           cleanup() { docker rm -f ghoney-ci >/dev/null 2>&1 || true; }
           trap cleanup EXIT
+          # Keep synthetic credentials scoped to this smoke test
+          admin_user=ghoney
+          admin_password=ci-admin-password
 
           docker run -d --name ghoney-ci \
+            --env GHONEY_ADMIN_USER="$admin_user" \
+            --env GHONEY_ADMIN_PASSWORD="$admin_password" \
             --cap-drop=ALL \
             --security-opt no-new-privileges \
             --read-only \
@@ -61,8 +79,8 @@ jobs:
 
           curl --retry 20 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:19090/health
           curl --fail http://127.0.0.1:18080/admin >/dev/null
-          curl --fail http://127.0.0.1:19090/dashboard >/dev/null
-          curl --fail http://127.0.0.1:19090/metrics | grep -q ghoney_http_requests_total
+          curl --fail --user "$admin_user:$admin_password" http://127.0.0.1:19090/dashboard >/dev/null
+          curl --fail --user "$admin_user:$admin_password" http://127.0.0.1:19090/metrics | grep -q ghoney_http_requests_total
 
           # Keep the dashboard off the public listener
           test "$(curl --output /dev/null --silent --write-out '%{http_code}' http://127.0.0.1:18080/dashboard)" = "404"
@@ -71,10 +89,24 @@ jobs:
         shell: bash
         run: |
           # Check the allowlist with runc before runsc
-          cleanup() { docker rm -f ghoney-seccomp >/dev/null 2>&1 || true; }
+          secret_directory="$(mktemp -d)"
+          secret_file="$secret_directory/admin-password"
+          cleanup() {
+            docker rm -f ghoney-seccomp >/dev/null 2>&1 || true
+            rm -f "$secret_file"
+            rmdir "$secret_directory"
+          }
           trap cleanup EXIT
+          # Keep synthetic credentials scoped to this smoke test
+          admin_user=ghoney
+          admin_password=ci-admin-password
+          printf '%s\n' "$admin_password" > "$secret_file"
+          chmod 644 "$secret_file"
 
           docker run -d --name ghoney-seccomp \
+            --env GHONEY_ADMIN_USER="$admin_user" \
+            --env GHONEY_ADMIN_PASSWORD_FILE=/run/secrets/ghoney_admin_password \
+            --mount type=bind,source="$secret_file",target=/run/secrets/ghoney_admin_password,readonly \
             --cap-drop=ALL \
             --security-opt no-new-privileges \
             --security-opt seccomp="$PWD/seccomp.json" \
@@ -87,10 +119,12 @@ jobs:
             ghoney:ci
 
           curl --retry 20 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:19090/health
-          curl --fail --request POST http://127.0.0.1:18080/api/v1/auth \
+          # Confirm that rejected credentials still reach telemetry
+          test "$(curl --output /dev/null --silent --write-out '%{http_code}' \
+            --request POST http://127.0.0.1:18080/api/v1/auth \
             --header "Content-Type: application/x-www-form-urlencoded" \
-            --data "u=' OR 1=1 --" >/dev/null
-          curl --fail http://127.0.0.1:19090/metrics | grep -q ghoney_honeypot_attacks_total
+            --data "u=' OR 1=1 --")" = "401"
+          curl --fail --user "$admin_user:$admin_password" http://127.0.0.1:19090/metrics | grep -q ghoney_honeypot_attacks_total
 
       - name: Install gVisor
         shell: bash
@@ -115,8 +149,13 @@ jobs:
           # Run the documented runsc and Seccomp combination
           cleanup() { docker rm -f ghoney-runsc >/dev/null 2>&1 || true; }
           trap cleanup EXIT
+          # Keep synthetic credentials scoped to this smoke test
+          admin_user=ghoney
+          admin_password=ci-admin-password
 
           docker run -d --name ghoney-runsc \
+            --env GHONEY_ADMIN_USER="$admin_user" \
+            --env GHONEY_ADMIN_PASSWORD="$admin_password" \
             --runtime=runsc \
             --cap-drop=ALL \
             --security-opt no-new-privileges \
@@ -131,3 +170,4 @@ jobs:
 
           curl --retry 20 --retry-all-errors --retry-delay 1 --fail http://127.0.0.1:19090/health
           curl --fail http://127.0.0.1:18080/.git/config >/dev/null
+          curl --fail --user "$admin_user:$admin_password" http://127.0.0.1:19090/dashboard >/dev/null

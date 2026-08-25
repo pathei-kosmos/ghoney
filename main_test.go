@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -10,7 +9,7 @@ import (
 	"unicode/utf8"
 )
 
-// Reset shared events between handler tests
+// Clear shared events before each handler test
 func resetRecentLogs(t *testing.T) {
 	t.Helper()
 	logMutex.Lock()
@@ -18,7 +17,7 @@ func resetRecentLogs(t *testing.T) {
 	logMutex.Unlock()
 }
 
-// TestDetectAttack covers the six documented signatures and benign traffic
+// Check the main structural signatures and their confidence
 func TestDetectAttack(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -26,13 +25,14 @@ func TestDetectAttack(t *testing.T) {
 		query      string
 		body       string
 		attackType string
+		confidence confidence
 	}{
-		{name: "SQL injection", path: "/api/v1/auth", body: "u=' OR 1=1 --", attackType: "SQL Injection"},
-		{name: "double-encoded traversal", path: "/", query: "p=..%252F..%252Fetc%252Fpasswd", attackType: "Path Traversal"},
-		{name: "XML external entity", path: "/", body: `<!ENTITY x SYSTEM "file:///etc/passwd">`, attackType: "XML Entity"},
-		{name: "command injection", path: "/", query: "cmd=whoami%20%26%26%20id", attackType: "Command Injection"},
-		{name: "SSRF", path: "/", query: "url=http://169.254.169.254/latest/meta-data/", attackType: "SSRF"},
-		{name: "file inclusion", path: "/", query: "file=php://filter/resource=/etc/passwd", attackType: "LFI/RFI"},
+		{name: "SQL injection", path: "/api/v1/auth", body: "u=' OR 1=1 --", attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "double-encoded traversal", path: "/", query: "p=..%252F..%252Fetc%252Fpasswd", attackType: "Path Traversal", confidence: confidenceHigh},
+		{name: "XML external entity", path: "/", body: `<!ENTITY x SYSTEM "file:///etc/passwd">`, attackType: "XML Entity", confidence: confidenceHigh},
+		{name: "command injection", path: "/", query: "cmd=whoami%20%26%26%20id", attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "SSRF", path: "/", query: "url=http://169.254.169.254/latest/meta-data/", attackType: "SSRF", confidence: confidenceHigh},
+		{name: "file inclusion", path: "/", query: "file=php://filter/resource=/etc/passwd", attackType: "LFI/RFI", confidence: confidenceHigh},
 		{name: "benign request", path: "/products", query: "next=release-notes", body: "color=blue", attackType: ""},
 	}
 
@@ -53,11 +53,14 @@ func TestDetectAttack(t *testing.T) {
 			if len(detections) != 1 || detections[0].AttackType != test.attackType {
 				t.Fatalf("detectAttacks() = %+v, want one %q detection", detections, test.attackType)
 			}
+			if detections[0].Confidence != test.confidence {
+				t.Fatalf("confidence = %q, want %q", detections[0].Confidence, test.confidence)
+			}
 		})
 	}
 }
 
-// TestDetectAttacksCoversCommonEvasions exercises bounded canonicalization and expanded signatures
+// Cover common evasions without relaxing normalization limits
 func TestDetectAttacksCoversCommonEvasions(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -311,7 +314,7 @@ func TestDetectAttacksCoversCommonEvasions(t *testing.T) {
 	}
 }
 
-// TestDetectAttacksKeepsIndependentSourcesIndependent guards against cross-field signatures
+// Keep request fields separate during signature matching
 func TestDetectAttacksKeepsIndependentSourcesIndependent(t *testing.T) {
 	tests := []detectionInput{
 		{Path: "/preview/127.0.0.1", Body: "url=https://example.com/release"},
@@ -346,7 +349,7 @@ func TestDetectAttacksKeepsIndependentSourcesIndependent(t *testing.T) {
 	}
 }
 
-// TestDetectionNormalizationStaysBounded protects the fixed work per source
+// Keep normalization work bounded for every source
 func TestDetectionNormalizationStaysBounded(t *testing.T) {
 	value := strings.Repeat("%2525", maxDetectionSourceSize)
 	variants := normalizeDetectionVariants(value, true)
@@ -360,7 +363,7 @@ func TestDetectionNormalizationStaysBounded(t *testing.T) {
 	}
 }
 
-// TestDetectionScansEveryAssignment prevents benign parameters from hiding a later target
+// Make sure an early safe parameter cannot hide a later target
 func TestDetectionScansEveryAssignment(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -393,7 +396,7 @@ func TestDetectionScansEveryAssignment(t *testing.T) {
 	}
 }
 
-// TestDetectionCoversTheAcceptedQueryTail keeps payloads beyond MaxHeaderBytes visible
+// Inspect the query tail accepted beyond MaxHeaderBytes
 func TestDetectionCoversTheAcceptedQueryTail(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -417,7 +420,7 @@ func TestDetectionCoversTheAcceptedQueryTail(t *testing.T) {
 	}
 }
 
-// TestDetectAttacksReturnsDistinctClasses preserves every family in a mixed request
+// Keep every attack family found in a mixed request
 func TestDetectAttacksReturnsDistinctClasses(t *testing.T) {
 	detections := detectAttacks(detectionInput{
 		Path:     "/",
@@ -430,7 +433,7 @@ func TestDetectAttacksReturnsDistinctClasses(t *testing.T) {
 	}
 }
 
-// hasDetectionType checks one fixed class without depending on details wording
+// Check one attack class without relying on detail text
 func hasDetectionType(detections []detection, attackType string) bool {
 	for _, detection := range detections {
 		if detection.AttackType == attackType {
@@ -440,7 +443,7 @@ func hasDetectionType(detections []detection, attackType string) bool {
 	return false
 }
 
-// detectionTypes returns stable classes for exact ordering assertions
+// Return stable class names for ordering checks
 func detectionTypes(detections []detection) []string {
 	types := make([]string, 0, len(detections))
 	for _, detection := range detections {
@@ -449,7 +452,7 @@ func detectionTypes(detections []detection) []string {
 	return types
 }
 
-// TestRequestInspectionScansTheFullAllowedBody checks beyond the stored snippet
+// Inspect the full allowed body beyond the stored snippet
 func TestRequestInspectionScansTheFullAllowedBody(t *testing.T) {
 	resetRecentLogs(t)
 	body := strings.Repeat("a", maxBodySnippetSize+50) + ";whoami"
@@ -477,7 +480,7 @@ func TestRequestInspectionScansTheFullAllowedBody(t *testing.T) {
 	}
 }
 
-// TestRequestInspectionStoresEachDistinctDetection covers middleware fan-out
+// Store each distinct detection produced by the middleware
 func TestRequestInspectionStoresEachDistinctDetection(t *testing.T) {
 	resetRecentLogs(t)
 	request := httptest.NewRequest(
@@ -508,7 +511,7 @@ func TestRequestInspectionStoresEachDistinctDetection(t *testing.T) {
 	}
 }
 
-// TestRequestInspectionRejectsOversizedBodies covers fixed and streamed bodies
+// Reject oversized fixed and streamed bodies
 func TestRequestInspectionRejectsOversizedBodies(t *testing.T) {
 	for _, streamed := range []bool{false, true} {
 		name := "fixed length"
@@ -539,7 +542,7 @@ func TestRequestInspectionRejectsOversizedBodies(t *testing.T) {
 	}
 }
 
-// TestMetricLabelsStayBounded keeps attacker input out of Prometheus labels
+// Keep request input out of Prometheus labels
 func TestMetricLabelsStayBounded(t *testing.T) {
 	for index := 0; index < 1000; index++ {
 		path := "/scanner/" + strings.Repeat("x", index%50) + string(rune('a'+index%26))
@@ -555,7 +558,7 @@ func TestMetricLabelsStayBounded(t *testing.T) {
 	}
 }
 
-// TestAdministrativeSurfaceIsSeparate checks the two route sets
+// Keep public and admin routes on separate handlers
 func TestAdministrativeSurfaceIsSeparate(t *testing.T) {
 	resetRecentLogs(t)
 	adminRequest := httptest.NewRequest(http.MethodGet, "http://example.test/admin", nil)
@@ -567,24 +570,24 @@ func TestAdministrativeSurfaceIsSeparate(t *testing.T) {
 
 	dashboardRequest := httptest.NewRequest(http.MethodGet, "http://example.test/dashboard", nil)
 	dashboardResponse := httptest.NewRecorder()
-	adminHandler().ServeHTTP(dashboardResponse, dashboardRequest)
+	adminHandler(adminCredentials{}).ServeHTTP(dashboardResponse, dashboardRequest)
 	if dashboardResponse.Code != http.StatusOK {
 		t.Fatalf("admin dashboard status = %d, want %d", dashboardResponse.Code, http.StatusOK)
 	}
 
 	decoyOnAdminRequest := httptest.NewRequest(http.MethodGet, "http://example.test/admin", nil)
 	decoyOnAdminResponse := httptest.NewRecorder()
-	adminHandler().ServeHTTP(decoyOnAdminResponse, decoyOnAdminRequest)
+	adminHandler(adminCredentials{}).ServeHTTP(decoyOnAdminResponse, decoyOnAdminRequest)
 	if decoyOnAdminResponse.Code != http.StatusNotFound {
 		t.Fatalf("decoy on admin status = %d, want %d", decoyOnAdminResponse.Code, http.StatusNotFound)
 	}
 }
 
-// TestSecurityHeadersRejectInlineScripts keeps inline execution out of the CSP
+// Keep inline script execution out of the CSP
 func TestSecurityHeadersRejectInlineScripts(t *testing.T) {
 	request := httptest.NewRequest(http.MethodGet, "http://example.test/health", nil)
 	response := httptest.NewRecorder()
-	adminHandler().ServeHTTP(response, request)
+	adminHandler(adminCredentials{}).ServeHTTP(response, request)
 
 	policy := response.Header().Get("Content-Security-Policy")
 	if strings.Contains(policy, "unsafe-inline") {
@@ -595,7 +598,7 @@ func TestSecurityHeadersRejectInlineScripts(t *testing.T) {
 	}
 }
 
-// TestTruncateUTF8 preserves valid UTF-8 within the byte cap
+// Keep valid UTF8 within the byte limit
 func TestTruncateUTF8(t *testing.T) {
 	value := strings.Repeat("é", 20)
 	truncated := truncateUTF8(value, 11)
@@ -606,7 +609,7 @@ func TestTruncateUTF8(t *testing.T) {
 		t.Fatal("truncated value is not valid UTF-8")
 	}
 
-	// Replacement runes expand invalid input and still count toward the cap
+	// Replacement runes still count toward the byte limit
 	repaired := truncateUTF8(string([]byte{0xff, 'a', 0xfe, 'b'}), 4)
 	if len(repaired) > 4 {
 		t.Fatalf("repaired value is %d bytes, want at most 4", len(repaired))
@@ -616,31 +619,28 @@ func TestTruncateUTF8(t *testing.T) {
 	}
 }
 
-// TestFakeJWTUsesFreshValidClaims checks decoy token shape and lifetime
-func TestFakeJWTUsesFreshValidClaims(t *testing.T) {
-	token, err := newFakeJWT()
-	if err != nil {
-		t.Fatalf("newFakeJWT() error = %v", err)
-	}
-	parts := strings.Split(token, ".")
-	if len(parts) != 3 {
-		t.Fatalf("JWT has %d parts, want 3", len(parts))
-	}
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		t.Fatalf("decode JWT payload: %v", err)
-	}
-	var claims struct {
-		Issued  int64 `json:"iat"`
-		Expires int64 `json:"exp"`
-	}
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		t.Fatalf("decode JWT claims: %v", err)
-	}
-	if claims.Expires <= claims.Issued {
-		t.Fatalf("JWT expiration %d is not after issued-at %d", claims.Expires, claims.Issued)
-	}
-	if lifetime := claims.Expires - claims.Issued; lifetime < 899 || lifetime > 901 {
-		t.Fatalf("JWT lifetime = %d seconds, want approximately 15 minutes", lifetime)
+// Make sure authentication never returns credentials
+func TestAPIV1AuthAlwaysRejects(t *testing.T) {
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodPut} {
+		t.Run(method, func(t *testing.T) {
+			request := httptest.NewRequest(method, "http://example.test/api/v1/auth", strings.NewReader("username=admin&password=secret"))
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			publicHandler().ServeHTTP(response, request)
+
+			if response.Code != http.StatusUnauthorized {
+				t.Fatalf("status = %d, want %d", response.Code, http.StatusUnauthorized)
+			}
+			if response.Header().Get("Cache-Control") != "no-store" {
+				t.Fatalf("Cache-Control = %q, want no-store", response.Header().Get("Cache-Control"))
+			}
+			var payload map[string]string
+			if err := json.Unmarshal(response.Body.Bytes(), &payload); err != nil {
+				t.Fatalf("decode auth response: %v", err)
+			}
+			if _, exists := payload["token"]; exists {
+				t.Fatal("authentication response unexpectedly contains a token")
+			}
+		})
 	}
 }

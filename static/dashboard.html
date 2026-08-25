@@ -3,99 +3,148 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>ghoney - Real-time Attack Dashboard</title>
+    <title>ghoney | Live attack dashboard</title>
     <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-    <header>
-        <h1>🍯 ghoney - Real-time Attack Dashboard</h1>
-        <p id="connection-status" class="connection-status" aria-live="polite">Connecting…</p>
-    </header>
-    <main>
-        <div class="grid-container">
-            <section id="attack-log" class="card">
-                <h2>Recent Activity (Last <span id="log-count-display">0</span> Events)</h2>
-                <div class="table-wrapper table-wide">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Timestamp</th>
-                                <th>IP Address</th>
-                                <th>User Agent</th>
-                                <th>Path</th>
-                                <th>Attack Type</th>
-                                <th>Details</th>
-                            </tr>
-                        </thead>
-                        <tbody id="attack-log-body">
-                            <!-- app.js renders event rows here -->
-                        </tbody>
-                    </table>
-                </div>
+    <div class="app-shell">
+        <!-- Compact identity and connection state -->
+        <header class="topbar">
+            <div class="brand">
+                <div class="brand-mark" aria-hidden="true">🍯</div>
+                <h1>ghoney</h1>
+            </div>
+            <p class="header-title">Real-time attack dashboard</p>
+            <div class="topbar-meta">
+                <p id="connection-status" class="connection-status" aria-live="polite">
+                    <span class="status-dot" aria-hidden="true"></span>
+                    <span id="connection-label">Connecting</span>
+                </p>
+                <time id="current-time" class="current-time">--:--:--</time>
+            </div>
+        </header>
+
+        <main class="dashboard">
+            <!-- Summary values derived from the retained event buffer -->
+            <section class="stats-grid" aria-label="Telemetry summary">
+                <button class="stat-card stat-yellow is-active" type="button" data-summary-view="all" aria-pressed="true">
+                    <span class="stat-index" aria-hidden="true">01</span>
+                    <span class="stat-copy">
+                        <span class="stat-label">Retained events</span>
+                        <strong id="log-count-display" class="stat-value">0</strong>
+                        <span class="stat-note">Up to 100 recent entries</span>
+                    </span>
+                </button>
+                <button class="stat-card stat-blue" type="button" data-summary-view="unique" aria-pressed="false">
+                    <span class="stat-index" aria-hidden="true">02</span>
+                    <span class="stat-copy">
+                        <span class="stat-label">Unique sources</span>
+                        <strong id="unique-ip-count" class="stat-value">0</strong>
+                        <span class="stat-note">Latest event from each IP</span>
+                    </span>
+                </button>
+                <button class="stat-card stat-red" type="button" data-summary-view="high" aria-pressed="false">
+                    <span class="stat-index" aria-hidden="true">03</span>
+                    <span class="stat-copy">
+                        <span class="stat-label">High confidence</span>
+                        <strong id="high-confidence-count" class="stat-value">0</strong>
+                        <span id="medium-confidence-note" class="stat-note">0 medium confidence</span>
+                    </span>
+                </button>
+                <button class="stat-card stat-green" type="button" data-summary-view="latest" aria-pressed="false">
+                    <span class="stat-index" aria-hidden="true">04</span>
+                    <span class="stat-copy">
+                        <span class="stat-label">Last activity</span>
+                        <strong id="last-activity" class="stat-value stat-value-small">None</strong>
+                        <span id="last-source" class="stat-note">Awaiting traffic</span>
+                    </span>
+                </button>
             </section>
 
-            <section id="top-attackers" class="card">
-                <h2>Top Attacking IPs</h2>
-                <div class="table-wrapper">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>IP Address</th>
-                                <th>Count</th>
-                            </tr>
-                        </thead>
-                        <tbody id="top-ips-body">
-                            <!-- app.js renders IP counts here -->
-                        </tbody>
-                    </table>
-                </div>
-            </section>
+            <!-- Main telemetry workspace -->
+            <div class="content-grid">
+                <section id="attack-log" class="panel activity-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <p class="panel-kicker">Live feed</p>
+                            <h2>Recent activity</h2>
+                        </div>
+                        <div class="activity-actions">
+                            <p id="activity-summary" class="panel-meta"><span class="live-dot" aria-hidden="true"></span>Newest first</p>
+                            <button id="clear-filter" class="clear-filter" type="button" hidden>Clear filters</button>
+                        </div>
+                    </div>
+                    <div class="table-wrapper table-wide">
+                        <table class="activity-table">
+                            <thead>
+                                <tr>
+                                    <th scope="col">Timestamp</th>
+                                    <th scope="col">IP address</th>
+                                    <th scope="col">User agent</th>
+                                    <th scope="col">Path</th>
+                                    <th scope="col">Attack type</th>
+                                    <th scope="col">Confidence</th>
+                                    <th scope="col">Details</th>
+                                </tr>
+                            </thead>
+                            <tbody id="attack-log-body"></tbody>
+                        </table>
+                    </div>
+                </section>
 
-            <section id="top-user-agents" class="card">
-                <h2>Top User Agents</h2>
-                 <div class="table-wrapper">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>User Agent</th>
-                                <th>Count</th>
-                            </tr>
-                        </thead>
-                        <tbody id="top-uas-body">
-                            <!-- app.js renders user-agent counts here -->
-                        </tbody>
-                    </table>
-                </div>
-            </section>
-            
-            <section id="payload-keywords" class="card">
-                <h2>Common Payload Keywords</h2>
-                <ul id="keywords-list">
-                    <!-- app.js renders keywords here -->
-                </ul>
-            </section>
-            
-            <section id="attack-types" class="card">
-                <h2>Attack Types</h2>
-                <div class="table-wrapper">
-                    <table>
-                        <thead>
-                            <tr>
-                                <th>Type</th>
-                                <th>Count</th>
-                            </tr>
-                        </thead>
-                        <tbody id="attack-types-body">
-                            <!-- app.js renders attack counts here -->
-                        </tbody>
-                    </table>
-                </div>
-            </section>
-        </div>
-    </main>
-    <footer>
-        <p>ghoney - A Minimalist HTTP Honeypot Canary Server</p>
-    </footer>
+                <aside class="insight-stack" aria-label="Event rankings">
+                    <section id="attack-types" class="panel compact-panel">
+                        <div class="panel-heading">
+                            <div>
+                                <p class="panel-kicker">Distribution</p>
+                                <h2>Attack types</h2>
+                            </div>
+                        </div>
+                        <div id="attack-types-list" class="rank-list"></div>
+                    </section>
+
+                    <section id="top-attackers" class="panel compact-panel">
+                        <div class="panel-heading">
+                            <div>
+                                <p class="panel-kicker">Sources</p>
+                                <h2>Top IP addresses</h2>
+                            </div>
+                        </div>
+                        <div id="top-ips-list" class="rank-list"></div>
+                    </section>
+                </aside>
+            </div>
+
+            <!-- Secondary context from the same event snapshot -->
+            <div class="secondary-grid">
+                <section id="top-user-agents" class="panel compact-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <p class="panel-kicker">Clients</p>
+                            <h2>Top user agents</h2>
+                        </div>
+                    </div>
+                    <div id="top-uas-list" class="rank-list"></div>
+                </section>
+
+                <section id="payload-keywords" class="panel compact-panel">
+                    <div class="panel-heading">
+                        <div>
+                            <p class="panel-kicker">Payloads</p>
+                            <h2>Payload indicators</h2>
+                        </div>
+                    </div>
+                    <ul id="keywords-list" class="keyword-list"></ul>
+                </section>
+            </div>
+        </main>
+
+        <footer class="footer">
+            <p><span>ghoney</span></p>
+            <p class="footer-center">Minimal HTTP canary</p>
+            <p id="app-version">dev</p>
+        </footer>
+    </div>
     <script src="/static/app.js"></script>
 </body>
 </html>

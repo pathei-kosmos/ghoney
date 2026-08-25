@@ -12,7 +12,7 @@
 **A small HTTP canary for the noisy parts of the internet.**
 
 <p>
-  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.26.5-00ADD8?logo=go&logoColor=white" alt="Go 1.26.5"></a>
+  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.25 or newer"></a>
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready"></a>
   <a href="https://github.com/pathei-kosmos/ghoney/actions/workflows/ci.yml"><img src="https://github.com/pathei-kosmos/ghoney/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-black.svg" alt="MIT License"></a>
@@ -25,23 +25,29 @@
 ## ✨ What it catches
 
 - SQL injection, path traversal, command injection, SSRF, LFI/RFI, and XML entity attacks
-- Encoded and obfuscated payloads across URLs, request bodies, and selected headers
+- XSS, JNDI/Log4Shell, and NoSQL injection
+- Percent-encoded and obfuscated payloads across URLs, request bodies, and selected headers
+- Gzip request bodies and Base64 values in query, form, and JSON fields
 - Requests to decoy routes such as `/admin`, `/api/v1/auth`, and `/.git/config`
 
-Unknown routes respond with a cancellable random 1-3 second delay. Request bodies, logs, metrics labels, concurrency, and the in-memory event buffer are all bounded.
+Detections have `high` or `medium` confidence. Strong signals are logged at `warn`, while ambiguous ones stay at `info`. A request produces at most one event per attack family.
+
+Request bodies are limited to 4 KiB before and after gzip decompression, with `413` returned above either limit. Metric labels and concurrency are also bounded. The memory buffer holds at most 100 events and preserves stronger signals when it fills up.
+
+The Git lure uses a random fake token under the reserved `.example.com` namespace, so it never points at a real external service. CMS routes and scanner fingerprinting remain outside the scope of this small canary.
 
 ## 🚀 Quick start
 
-You need Git and a running Docker Engine.
+You need Git and a running Docker Engine. Replace the example admin password before starting the container.
 
 ```bash
 git clone https://github.com/pathei-kosmos/ghoney.git
 cd ghoney
 docker build -t ghoney .
-docker run -d --name ghoney_server --cap-drop=ALL --security-opt no-new-privileges -p 8080:8080 -p 127.0.0.1:9090:9090 --restart unless-stopped --read-only --memory=128m --cpus=1 --pids-limit=64 --log-driver=json-file --log-opt max-size=10m --log-opt max-file=3 ghoney
+docker run -d --name ghoney_server --env GHONEY_ADMIN_PASSWORD='USE-AT-LEAST-16-CHARS' --cap-drop=ALL --security-opt no-new-privileges -p 8080:8080 -p 127.0.0.1:9090:9090 --restart unless-stopped --read-only --memory=128m --cpus=1 --pids-limit=64 --log-driver=json-file --log-opt max-size=10m --log-opt max-file=3 ghoney
 ```
 
-Open the local dashboard at [localhost:9090/dashboard](http://localhost:9090/dashboard).
+Open the local dashboard at [localhost:9090/dashboard](http://localhost:9090/dashboard) and sign in as `ghoney` with that password.
 
 | URL | Purpose |
 | --- | --- |
@@ -54,9 +60,21 @@ Open the local dashboard at [localhost:9090/dashboard](http://localhost:9090/das
 
 Port `8080` is the public honeypot surface. Port `9090` is published on host loopback only, so remote hosts cannot reach the dashboard directly.
 
+The public and administrative listeners accept these environment variables:
+
+| Variable | Default | Rule |
+| --- | --- | --- |
+| `GHONEY_ADDR` | `:8080` | Public listen address |
+| `GHONEY_ADMIN_ADDR` | `127.0.0.1:9090` | Docker defaults to `:9090`, non-loopback addresses require authentication |
+| `GHONEY_ADMIN_USER` | `ghoney` | Must not contain `:` or control characters |
+| `GHONEY_ADMIN_PASSWORD` | unset | Use at least 16 characters, with a 256-byte limit |
+| `GHONEY_ADMIN_PASSWORD_FILE` | unset | Reads the password from a file and cannot be combined with `GHONEY_ADMIN_PASSWORD` |
+
+Authentication protects `/dashboard`, its assets, `/api/dashboard-data`, and `/metrics`. `/health` stays public for probes. **Basic Auth controls access but does not encrypt traffic. Keep the admin port on host loopback or place every network connection behind HTTPS, an SSH tunnel, or another trusted encrypted transport.**
+
 ## 🧪 Verify detection
 
-These requests generate one event for each supported attack family:
+Together, these requests generate at least one event for every supported attack family:
 
 ```bash
 curl -X POST "http://localhost:8080/api/v1/auth" -H "Content-Type: application/x-www-form-urlencoded" --data "u=' OR 1=1 --"
@@ -65,16 +83,35 @@ curl -X POST "http://localhost:8080/" -H "Content-Type: application/xml" --data 
 curl "http://localhost:8080/?cmd=whoami%20%26%26%20id"
 curl "http://localhost:8080/?url=http://169.254.169.254/latest/meta-data/"
 curl "http://localhost:8080/?file=php://filter/read=convert.base64-encode/resource=/etc/passwd"
+curl "http://localhost:8080/?q=%3Csvg%20onload%3Dalert(1)%3E"
+curl -H 'User-Agent: ${jndi:ldap://127.0.0.1/a}' "http://localhost:8080/"
+curl "http://localhost:8080/?user%5B%24ne%5D=guest"
 ```
 
-The authentication endpoint responds with `HTTP 200`. The other requests target the undefined `/` route and respond with `HTTP 404` after the intentional delay. All payloads are detected, and mixed payloads generate one event per attack family.
+The authentication endpoint always returns `HTTP 401` JSON with `Cache-Control: no-store`. It never emits a JWT, but its payload is still inspected. Unknown routes return `HTTP 404` without delay and appear as weak access events in the dashboard.
 
 Review the events in the dashboard or from the command line:
 
 ```bash
-curl http://localhost:9090/api/dashboard-data
+curl --user ghoney http://localhost:9090/api/dashboard-data
 docker logs ghoney_server
 ```
+
+`ghoney_honeypot_attacks_total` keeps its original labels. `ghoney_honeypot_detections_total` adds the bounded `confidence` label. Prometheus can authenticate directly:
+
+```yaml
+scrape_configs:
+  - job_name: ghoney
+    static_configs:
+      - targets: ["ghoney:9090"]
+    basic_auth:
+      username: ghoney
+      password_file: /run/secrets/ghoney_admin_password
+```
+
+For Docker or Kubernetes secrets, mount the same secret file into ghoney and set `GHONEY_ADMIN_PASSWORD_FILE` to its container path. The direct environment variable remains available for simple local runs.
+
+The event buffer and local counters reset on restart. Use Docker logs and Prometheus for retention.
 
 ## 🛡️ Layered isolation
 
@@ -90,12 +127,15 @@ docker logs ghoney_server
 | **Custom Seccomp** | Replaces Docker's general policy with ghoney's narrower x86-64 Linux syscall allowlist |
 | **gVisor** | Optionally places a user-space kernel between ghoney and the host |
 
-The quick start uses Docker's default Seccomp policy automatically; it does not require the custom profile or gVisor. This works with Docker Engine on Linux and Docker Desktop running Linux containers on Windows or macOS. No application data is persisted by ghoney.
+The quick start uses Docker's default Seccomp policy automatically. It does not require the custom profile or gVisor. This works with Docker Engine on Linux and Docker Desktop running Linux containers on Windows or macOS. The custom profile keeps `execve` because the container runtime needs it to start `/ghoney`. The application never launches child processes.
 
 For tighter syscall isolation on x86-64 Linux, ghoney includes a [project-specific Seccomp allowlist](seccomp.json) that reduces the kernel-facing attack surface beyond Docker's general-purpose default profile:
 
+Replace the example admin password as in the quick start.
+
 ```bash
 docker run -d --name ghoney_server \
+  --env GHONEY_ADMIN_PASSWORD='USE-AT-LEAST-16-CHARS' \
   --cap-drop=ALL \
   --security-opt seccomp="$(pwd)/seccomp.json" \
   --security-opt no-new-privileges \

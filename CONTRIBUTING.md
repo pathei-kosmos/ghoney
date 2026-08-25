@@ -11,12 +11,15 @@ Bug reports and focused improvements are welcome. Please open an issue before pr
 
    ```bash
    go fmt ./...
-   go test ./...
+   go test -race ./...
    go vet ./...
    docker build -t ghoney .
+   docker run --rm -e GHONEY_ADMIN_PASSWORD='development-password' ghoney
    ```
 
 5. Include targeted tests for behavior changes. Avoid redundant assertions based on response wording or implementation details.
 6. Submit a pull request describing the problem, the chosen tradeoff, and how it was verified.
 
 Changes to `seccomp.json`, container isolation, request parsing, logging, or dashboard rendering must include a regression test or an integration check.
+
+The module supports Go 1.25 and newer.
