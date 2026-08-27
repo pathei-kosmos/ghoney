@@ -9,7 +9,7 @@
  |___/                        |___/
 ```
 
-**A small HTTP canary for the noisy parts of the internet.**
+**A small HTTP honeypot for the noisy parts of the internet.**
 
 <p>
   <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.25 or newer"></a>
@@ -18,7 +18,7 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-black.svg" alt="MIT License"></a>
 </p>
 
-**ghoney** exposes believable bait endpoints, detects common attack patterns, and turns the resulting traffic into structured logs, [Prometheus](https://prometheus.io/) metrics, and a local dashboard. It stays deliberately small and ephemeral, with a [Distroless](https://github.com/GoogleContainerTools/distroless) image, a non-root runtime, a read-only filesystem, and optional [gVisor](https://gvisor.dev/) and custom [Seccomp](https://en.wikipedia.org/wiki/Seccomp) isolation.
+**ghoney** is a lightweight HTTP honeypot that exposes believable bait endpoints, detects common attack patterns, and turns the resulting traffic into structured logs, [Prometheus](https://prometheus.io/) metrics, and a local dashboard. It stays deliberately small and ephemeral, with a [Distroless](https://github.com/GoogleContainerTools/distroless) image, a non-root runtime, a read-only filesystem, and optional [gVisor](https://gvisor.dev/) and custom [Seccomp](https://en.wikipedia.org/wiki/Seccomp) isolation.
 
 ![ghoney dashboard](img/dashboard.png)
 
@@ -34,7 +34,7 @@ Detections have `high` or `medium` confidence. Strong signals are logged at `war
 
 Request bodies are limited to 4 KiB before and after gzip decompression, with `413` returned above either limit. Metric labels and concurrency are also bounded. The memory buffer holds at most 100 events and preserves stronger signals when it fills up.
 
-The Git lure uses a random fake token under the reserved `.example.com` namespace, so it never points at a real external service. CMS routes and scanner fingerprinting remain outside the scope of this small canary.
+The Git lure uses a random fake token under the reserved `.example.com` namespace, so it never points at a real external service. CMS routes and scanner fingerprinting remain outside the scope of this small honeypot.
 
 ## 🚀 Quick start
 
@@ -127,11 +127,11 @@ The event buffer and local counters reset on restart. Use Docker logs and Promet
 | **Custom Seccomp** | Replaces Docker's general policy with ghoney's narrower x86-64 Linux syscall allowlist |
 | **gVisor** | Optionally places a user-space kernel between ghoney and the host |
 
-The quick start uses Docker's default Seccomp policy automatically. It does not require the custom profile or gVisor. This works with Docker Engine on Linux and Docker Desktop running Linux containers on Windows or macOS. The custom profile keeps `execve` because the container runtime needs it to start `/ghoney`. The application never launches child processes.
+The quick start uses Docker's default Seccomp policy automatically. It does not require the custom profile or gVisor and works with Docker Engine on Linux or Docker Desktop running Linux containers on Windows or macOS.
 
-For tighter syscall isolation on x86-64 Linux, ghoney includes a [project-specific Seccomp allowlist](seccomp.json) that reduces the kernel-facing attack surface beyond Docker's general-purpose default profile:
+### Custom Seccomp profile
 
-Replace the example admin password as in the quick start.
+On x86-64 Linux, you can replace Docker's default policy with ghoney's [project-specific Seccomp allowlist](seccomp.json) for tighter syscall isolation. Run the following command from the repository root and replace the example admin password before starting the container:
 
 ```bash
 docker run -d --name ghoney_server \
@@ -152,7 +152,11 @@ docker run -d --name ghoney_server \
   ghoney
 ```
 
-To add gVisor, install `runsc`, confirm that it appears in `docker info`, then add `--runtime=runsc` to the command above. gVisor is not generally available through Docker Desktop on Windows or macOS.
+The custom profile keeps `execve` because the container runtime needs it to start `/ghoney`, the application itself never launches child processes.
+
+### Add gVisor
+
+For an additional isolation layer, install `runsc` and confirm that the `runsc` runtime appears in `docker info`. You can then combine gVisor with the custom Seccomp profile by adding `--runtime=runsc` to the command above. gVisor is not generally available through Docker Desktop on Windows or macOS.
 
 > **ghoney** is designed to receive hostile input. Expose only port `8080`, never place real credentials in a decoy, and put remote dashboard access behind an authenticated HTTPS proxy or SSH tunnel.
 
