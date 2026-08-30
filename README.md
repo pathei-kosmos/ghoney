@@ -27,7 +27,7 @@
 - SQL injection, path traversal, command injection, SSRF, LFI/RFI, and XML entity attacks
 - XSS, JNDI/Log4Shell, and NoSQL injection
 - Percent-encoded and obfuscated payloads across URLs, request bodies, and selected headers
-- Gzip request bodies and Base64 values in query, form, and JSON fields
+- Nested gzip request bodies and Base64 values in query, form, JSON, multipart text, and Basic Authorization fields
 - Requests to decoy routes such as `/admin`, `/api/v1/auth`, and `/.git/config`
 
 Detections have `high` or `medium` confidence. Strong signals are logged at `warn`, while ambiguous ones stay at `info`. A request produces at most one event per attack family.

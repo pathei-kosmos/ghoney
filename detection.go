@@ -6,6 +6,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"html"
+	"io"
+	"mime"
+	"mime/multipart"
 	"net"
 	"net/http"
 	"net/url"
@@ -32,8 +35,9 @@ const (
 	maxDetectionSourceSize = maxHeaderBytes + 4*1024
 	// Leave room for Unicode case folding without losing the tail
 	maxCanonicalSourceSize = maxDetectionSourceSize * 2
-	maxDetectionSources    = 16
-	maxDecodePasses        = 3
+	maxDetectionSources    = 20
+	maxDecodePasses        = 5
+	maxNestedGzipLayers    = 3
 	maxXMLExpansionSize    = maxRequestBodySize * 8
 	requestTimeout         = 5 * time.Second
 	shutdownTimeout        = 5 * time.Second
@@ -48,12 +52,17 @@ const (
 	defaultAdminUser       = "ghoney"
 	minAdminPasswordBytes  = 16
 	maxAdminPasswordBytes  = 256
-	maxJNDIExpansionPasses = 4
-	maxBase64Candidates    = 16
+	maxJNDIExpansionPasses = 6
 	minBase64ValueSize     = 8
 	unknownMetricRoute     = "not_found"
 	unknownMetricMethod    = "OTHER"
-	asciiArtBanner         = `
+	// Keep command groups together for every shell context
+	commandCoreBinaryNames     = `whoami|uname|cat|curl|wget|ping|sh|bash|dash|zsh|nc|netcat|powershell|pwsh|cmd|nslookup|dig|printenv|sleep|python|python3|perl|ruby|busybox`
+	commandExtendedBinaryNames = `echo|chmod|chown|cut|head|tail|grep|awk|sed|dd|find|xargs|tee|ssh|scp|socat|openssl|base64|tar|node|php|java|docker|kubectl|ipconfig|certutil|wmic|bitsadmin|mshta|rundll32|regsvr32|cscript|net|sc|type|dir`
+	commandExplicitBinaryGroup = `(?:` + commandCoreBinaryNames + `|` + commandExtendedBinaryNames + `)`
+	commandAllBinaryGroup      = `(?:id|env|ls|` + commandCoreBinaryNames + `|` + commandExtendedBinaryNames + `)`
+	commandGenericBinaryGroup  = `(?:whoami|uname|ipconfig|certutil|wmic|bitsadmin|mshta|rundll32|regsvr32|cscript)`
+	asciiArtBanner             = `
        _
   __ _| |__   ___  _ __   ___ _   _
  / _` + "`" + ` | '_ \ / _ \| '_ \ / _ \ | | |
@@ -168,13 +177,15 @@ var (
 
 	// Compile signatures once at startup
 	pathTraversalRegex             = regexp.MustCompile(`(?:\.{2,}[/\\]|\.\.;[/\\])`)
-	sqlQuotedBooleanRegex          = regexp.MustCompile("(?i)(?:'|\"|`|\\))\\s*(?:or|and)\\s+(?:not\\s+)?(?:\\d+|'[^']*'|\"[^\"]*\")\\s*(?:=|like)\\s*(?:\\d+|'[^']*'|\"[^\"]*\")")
-	sqlTruncatedQuotedBooleanRegex = regexp.MustCompile("(?i)(?:'|\")\\)?\\s*(?:or|and)\\s+\\(?\\s*(?:'[^']{0,128}'|\"[^\"]{0,128}\")\\s*(?:=|like)\\s*(?:'[^']{0,128}|\"[^\"]{0,128})")
-	sqlNumericBooleanRegex         = regexp.MustCompile(`(?i)(?:^|[?&;\s])(?:[a-z_][a-z0-9_.-]*=)?\d+\s+(?:or|and)\s+\d+\s*=\s*\d+`)
+	sqlQuotedBooleanRegex          = regexp.MustCompile("(?i)(?:'|\"|`|\\))\\s*(?:or|and|xor|\\|\\||&&)\\s*(?:not\\s+)?(?:\\d+|'[^']*'|\"[^\"]*\")\\s*(?:=|<>|!=|>=|<=|>|<|like|regexp)\\s*(?:\\d+|'[^']*'|\"[^\"]*\")")
+	sqlTruncatedQuotedBooleanRegex = regexp.MustCompile("(?i)(?:'|\")\\)?\\s*(?:or|and|xor|\\|\\||&&)\\s*\\(?\\s*(?:'[^']{0,128}'|\"[^\"]{0,128}\")\\s*(?:=|<>|!=|>=|<=|>|<|like|regexp)\\s*(?:'[^']{0,128}|\"[^\"]{0,128})")
+	sqlNumericBooleanRegex         = regexp.MustCompile(`(?i)(?:^|[?&;\s])(?:[a-z_][a-z0-9_.-]*=)?\d+\s+(?:or|and|xor|\|\||&&)\s+\d+\s*(?:=|<>|!=|>=|<=|>|<)\s*\d+`)
 	sqlCommentTailRegex            = regexp.MustCompile("(?i)(?:'|\"|`)\\s*(?:--|#)")
 	sqlUnionRegex                  = regexp.MustCompile(`(?i)\bunion(?:\s+(?:all\s+)?select\b|(?:\s+all)?\s*\(\s*select\b)`)
 	sqlFunctionRegex               = regexp.MustCompile(`(?i)\b(?:benchmark|pg_sleep|load_file|xp_cmdshell|extractvalue|updatexml)\s*\(|\bwaitfor\s+delay\b|\binto\s+outfile\b|\binformation_schema\b`)
 	sqlSleepRegex                  = regexp.MustCompile(`(?i)\bsleep\s*\(`)
+	sqlConditionalRegex            = regexp.MustCompile("(?i)(?:'|\"|`|\\))\\s*(?:or|and|xor|\\|\\||&&)\\s*\\(*\\s*(?:case\\s+when\\b|if\\s*\\()")
+	sqlHavingRegex                 = regexp.MustCompile("(?i)(?:'|\"|`|\\))\\s*having\\s+\\(*\\s*(?:\\d+|'[^']*'|\"[^\"]*\")\\s*(?:=|<>|!=|>=|<=|>|<|like|regexp)\\s*(?:\\d+|'[^']*'|\"[^\"]*\")")
 	sqlStackedRegex                = regexp.MustCompile(`(?i);\s*(?:select|insert|update|delete|drop|alter|create|exec|execute)\b`)
 	sqlStructuredStackedRegex      = regexp.MustCompile(`(?i);\s*(?:select\b.{0,512}\bfrom\b|insert\s+into\b|update\s+[^\s;]{1,128}\s+set\b|delete\s+from\b|(?:drop|alter|create)\s+(?:table|database|schema|index|view|user|procedure|function)\b|(?:exec|execute)\s+(?:xp_cmdshell|sp_executesql)\b)`)
 	sqlVersionCommentRegex         = regexp.MustCompile(`(?is)/\*!\d{0,6}\s*(.*?)\*/`)
@@ -185,29 +196,36 @@ var (
 	xmlEntityDeclaration           = regexp.MustCompile(`(?is)<!entity\s+(%\s*)?([a-z_][a-z0-9_:.-]*)\s+(?:"([^"]*)"|'([^']*)')\s*>`)
 	xmlEntityReference             = regexp.MustCompile(`(?i)([&%])([a-z_][a-z0-9_:.-]*);`)
 	commandAmbiguousSeparatorRegex = regexp.MustCompile("(?i)(?:;|&[\\t ]*)[\\t ]*(?:(?:\\$\\{ifs\\}|\\$ifs\\$9)[\\t ]*)*(?:sudo[\\t ]+)?(?:/usr/bin/|/bin/)?\\b(?:id|env|ls)(?:\\.exe)?(?:[\\t ]|$|[;&|)`<>]|\\$\\{ifs\\}|\\$ifs(?:\\$9)?)")
-	commandExplicitSeparatorRegex  = regexp.MustCompile("(?i)(?:;|&[\\t ]*)[\\t ]*(?:(?:\\$\\{ifs\\}|\\$ifs\\$9)[\\t ]*)*(?:sudo[\\t ]+)?(?:/usr/bin/|/bin/)?\\b(?:whoami|uname|cat|curl|wget|ping|sh|bash|dash|zsh|nc|netcat|powershell|pwsh|cmd|nslookup|dig|printenv|sleep|python|python3|perl|ruby|busybox)(?:\\.exe)?(?:[\\t ]|$|[;&|)`<>]|\\$\\{ifs\\}|\\$ifs(?:\\$9)?)")
-	commandStrongSeparatorRegex    = regexp.MustCompile("(?i)(?:\\|\\||&&|\\||[\\r\\n])[\\t ]*(?:(?:\\$\\{ifs\\}|\\$ifs\\$9)[\\t ]*)*(?:sudo[\\t ]+)?(?:/usr/bin/|/bin/)?\\b(?:whoami|id|uname|cat|curl|wget|ping|sh|bash|dash|zsh|nc|netcat|powershell|pwsh|cmd|nslookup|dig|env|printenv|ls|sleep|python|python3|perl|ruby|busybox)(?:\\.exe)?(?:[\\t ]|$|[;&|)`<>]|\\$\\{ifs\\}|\\$ifs(?:\\$9)?)")
-	commandSubstitutionRegex       = regexp.MustCompile("(?i)(?:\\$\\(|`)[\\t ]*(?:(?:\\$\\{ifs\\}|\\$ifs\\$9)[\\t ]*)*(?:sudo[\\t ]+)?(?:/usr/bin/|/bin/)?(?:whoami|id|uname|cat|curl|wget|ping|sh|bash|dash|zsh|nc|netcat|powershell|pwsh|cmd|nslookup|dig|env|printenv|ls|sleep|python|python3|perl|ruby|busybox)\\b")
-	commandAssignmentRegex         = regexp.MustCompile(`(?i)(?:^|[?&;,\s{])["']?(?:cmd|command|exec|execute|shell)["']?\s*(?:=|:)\s*["']?(?:/usr/bin/|/bin/)?(?:whoami|id|uname|cat|curl|wget|ping|sh|bash|dash|zsh|nc|netcat|powershell|pwsh|cmd|nslookup|dig|env|printenv|ls|sleep|python|python3|perl|ruby|busybox)(?:\.exe)?\b`)
+	commandExplicitSeparatorRegex  = regexp.MustCompile("(?i)(?:;|&[\\t ]*)[\\t ]*(?:(?:\\$\\{ifs\\}|\\$ifs\\$9)[\\t ]*)*(?:sudo[\\t ]+)?(?:/usr/bin/|/bin/)?\\b" + commandExplicitBinaryGroup + "(?:\\.exe)?(?:[\\t ]|$|[;&|)`<>]|\\$\\{ifs\\}|\\$ifs(?:\\$9)?)")
+	commandStrongSeparatorRegex    = regexp.MustCompile("(?i)(?:\\|\\||&&|\\||[\\r\\n])[\\t ]*(?:(?:\\$\\{ifs\\}|\\$ifs\\$9)[\\t ]*)*(?:sudo[\\t ]+)?(?:/usr/bin/|/bin/)?\\b" + commandAllBinaryGroup + "(?:\\.exe)?(?:[\\t ]|$|[;&|)`<>]|\\$\\{ifs\\}|\\$ifs(?:\\$9)?)")
+	commandSubstitutionRegex       = regexp.MustCompile("(?i)(?:\\$\\(|`)[\\t ]*(?:(?:\\$\\{ifs\\}|\\$ifs\\$9)[\\t ]*)*(?:sudo[\\t ]+)?(?:/usr/bin/|/bin/)?" + commandAllBinaryGroup + "\\b")
+	commandAssignmentRegex         = regexp.MustCompile(`(?i)(?:^|[?&;,\s{])["']?(?:cmd|command|exec|execute|shell)["']?\s*(?:=|:)\s*["']?(?:/usr/bin/|/bin/)?` + commandAllBinaryGroup + `(?:\.exe)?\b`)
+	commandGenericAssignmentRegex  = regexp.MustCompile(`(?i)(?:^|[?&;,\s{])["']?[a-z_][a-z0-9_.-]{0,63}["']?\s*(?:=|:)\s*["']?(?:/usr/bin/|/bin/)?` + commandGenericBinaryGroup + `(?:\.exe)?\b`)
 	ssrfHighAssignmentRegex        = regexp.MustCompile(`(?i)(?:^|[?&;,\s{])["']?(?:url|uri|redirect|next|target|dest|destination|callback|continue|return|return_url|endpoint|proxy|fetch|webhook)["']?\s*(?:=|:)\s*["']?([^"'&,\s}]+)`)
-	ssrfMediumAssignmentRegex      = regexp.MustCompile(`(?i)(?:^|[?&;,\s{])["']?(?:host|src|image)["']?\s*(?:=|:)\s*["']?([^"'&,\s}]+)`)
-	localFileRegex                 = regexp.MustCompile(`(?i)(?:/(?:etc/(?:passwd|shadow|hosts|sudoers)|proc/(?:self|\d+)/(?:environ|cmdline|maps)|var/log/(?:auth\.log|secure)|root/\.ssh/)|[a-z]:\\(?:windows\\(?:win\.ini|system32(?:\\|$))|boot\.ini)|(?:php|file|zip|phar|expect|input|glob|ssh2)://)`)
+	ssrfMediumAssignmentRegex      = regexp.MustCompile(`(?i)(?:^|[?&;,\s{])["']?(?:host|src|image|img|feed|u|site|load|ref|goto|r|open)["']?\s*(?:=|:)\s*["']?([^"'&,\s}]+)`)
+	localFileRegex                 = regexp.MustCompile(`(?i)(?:(?:^|[/\\])(?:etc[/\\](?:passwd|shadow|hosts|sudoers|group)|proc[/\\](?:self|\d+)[/\\](?:environ|cmdline|maps)|var[/\\]log[/\\](?:auth\.log|secure)|root[/\\](?:\.ssh[/\\]|\.bash_history)|windows[/\\](?:win\.ini|system32(?:[/\\]|$))|winnt[/\\]win\.ini|\.aws[/\\]credentials|\.env(?:$|[/?#])|[^/\\]*(?:id_rsa|web\.config|wp-config\.php)(?:$|[/?#]))|[a-z]:\\(?:windows\\(?:win\.ini|system32(?:\\|$))|boot\.ini)|(?:php|file|zip|phar|expect|input|glob|ssh2)://)`)
 	fileAssignmentRegex            = regexp.MustCompile(`(?i)(?:^|[?&;,\s])(?:file|page|include|template|path|document|folder|root)(?:\[[a-z0-9_-]*\])?\s*=\s*["']?([^"'&,\s}]+)`)
 	fileJSONAssignmentRegex        = regexp.MustCompile(`(?i)["'](?:file|page|include|template|path|document|folder|root)["']\s*:\s*["']([^"']+)`)
-	xssActiveTagRegex              = regexp.MustCompile(`(?is)<\s*/?\s*(?:script|iframe|object|embed)\b`)
-	xssAmbiguousTagRegex           = regexp.MustCompile(`(?is)<\s*/?\s*(?:svg|math|img|video|audio|link|meta|style)\b`)
-	xssEventHandlerRegex           = regexp.MustCompile(`(?i)(?:^|[\t\n\f\r <"'=])(?:onerror|onload|onclick|onmouseover|onfocus|onblur|onsubmit|oninput|onchange|onanimationstart|ontoggle|onpointerover|onmouseenter|onmouseleave|onmessage|onhashchange)\s*=`)
-	xssTagEventHandlerRegex        = regexp.MustCompile(`(?is)<[^<>]{0,1000}[\t\n\f\r ]on[a-z][a-z0-9_-]*\s*=`)
+	xssActiveTagRegex              = regexp.MustCompile(`(?is)<\s*/?\s*(?:script|iframe|object|embed|applet)\b`)
+	xssAmbiguousTagRegex           = regexp.MustCompile(`(?is)<\s*/?\s*(?:svg|math|img|video|audio|link|meta|style|base|form|frame|frameset|details|template|isindex)\b`)
+	xssEventHandlerRegex           = regexp.MustCompile(`(?i)(?:^|[\t\n\f\r /<"'=])(?:onerror|onload|onclick|onmouseover|onfocus|onblur|onsubmit|oninput|onchange|onanimationstart|ontoggle|onpointerover|onmouseenter|onmouseleave|onmessage|onhashchange)\s*=`)
+	xssTagEventHandlerRegex        = regexp.MustCompile(`(?is)<[^<>]{0,1000}[\t\n\f\r /]on[a-z][a-z0-9_-]*\s*=`)
+	xssSVGAnimationHandlerRegex    = regexp.MustCompile(`(?is)<\s*(?:set|animate)\b[^<>]{0,1000}\battributename\s*=\s*["']?on[a-z][a-z0-9_-]*["']?[^<>]{0,1000}\bto\s*=`)
 	xssJavaScriptURIRegex          = regexp.MustCompile(`(?i)\bjavascript\s*:`)
 	jndiLookupRegex                = regexp.MustCompile(`(?i)\$\{\s*jndi\s*:`)
 	jndiExpandedLookupRegex        = regexp.MustCompile(`(?i)\bjndi\s*:`)
-	jndiCaseLookupRegex            = regexp.MustCompile(`(?i)\$\{\s*(?:lower|upper)\s*:\s*([^{}])\s*}`)
-	jndiDefaultLookupRegex         = regexp.MustCompile(`(?i)\$\{\s*::-\s*([^{}])\s*}`)
-	jndiEnvironmentDefaultRegex    = regexp.MustCompile(`(?i)\$\{\s*env\s*:[^{}:]{1,128}:-\s*([^{}])\s*}`)
+	jndiCaseLookupRegex            = regexp.MustCompile(`(?i)\$\{\s*(?:lower|upper)\s*:\s*([^{}]{1,64}?)\s*}`)
+	jndiDefaultLookupRegex         = regexp.MustCompile(`(?i)\$\{\s*(?:::\s*|[a-z_][a-z0-9_.-]{0,32}\s*:\s*)-\s*([^{}]{1,64}?)\s*}`)
+	jndiEnvironmentDefaultRegex    = regexp.MustCompile(`(?i)\$\{\s*env\s*:[^{}:]{1,128}:-\s*([^{}]{1,64}?)\s*}`)
 	detectionRuneReplacer          = strings.NewReplacer(
 		"／", "/", "∕", "/", "⁄", "/",
 		"＼", `\`, "﹨", `\`,
 		"．", ".", "｡", ".", "。", ".",
+	)
+	legacyUTF8SeparatorReplacer = strings.NewReplacer(
+		"\xc0\xae", ".", "\xc0\xaf", "/", "\xc1\x9c", `\`,
+		"\xe0\x80\xae", ".", "\xe0\x80\xaf", "/", "\xe0\x81\x9c", `\`,
+		"\xf0\x80\x80\xae", ".", "\xf0\x80\x80\xaf", "/", "\xf0\x80\x81\x9c", `\`,
 	)
 	urlIgnoredControlReplacer = strings.NewReplacer("\t", "", "\n", "", "\r", "")
 	inspectedHeaderNames      = [...]string{
@@ -216,6 +234,10 @@ var (
 		"Referer",
 		"User-Agent",
 		"X-Forwarded-Host",
+		"X-Forwarded-For",
+		"X-Real-IP",
+		"X-Host",
+		"True-Client-IP",
 		"X-Original-URL",
 		"X-Rewrite-URL",
 	}
@@ -310,6 +332,8 @@ func buildDetectionSources(input detectionInput) []detectionSource {
 				variants = appendBase64ParameterVariants(variants, boundedValue)
 			case isJSONContentType(input.Header.Get("Content-Type")):
 				variants = appendBase64JSONVariants(variants, boundedValue)
+			case isMultipartContentType(input.Header.Get("Content-Type")):
+				variants = appendBase64MultipartVariants(variants, boundedValue, input.Header.Get("Content-Type"))
 			}
 		}
 		if len(variants) > 0 {
@@ -326,6 +350,9 @@ func buildDetectionSources(input detectionInput) []detectionSource {
 		}
 	}
 	appendDetectionSource("Host header", input.Host, false)
+	if decoded, ok := decodeBasicAuthorization(input.Header.Get("Authorization")); ok {
+		appendDetectionSource("decoded Authorization header", decoded, false)
+	}
 
 	for _, name := range inspectedHeaderNames {
 		if len(sources) >= maxDetectionSources {
@@ -397,6 +424,12 @@ func isJSONContentType(contentType string) bool {
 	return contentType == "application/json" || strings.HasSuffix(contentType, "+json")
 }
 
+// Recognize multipart forms and leave malformed values to the raw scanner
+func isMultipartContentType(contentType string) bool {
+	mediaType, _, err := mime.ParseMediaType(contentType)
+	return err == nil && strings.EqualFold(mediaType, "multipart/form-data")
+}
+
 // Add bounded decoded values without joining independent fields
 func appendBase64ParameterVariants(variants []string, value string) []string {
 	fields := make([]base64Field, 0)
@@ -412,7 +445,7 @@ func appendBase64ParameterVariants(variants []string, value string) []string {
 		}
 		fields = append(fields, base64Field{key: decodedKey, value: decodedValue})
 	}
-	return appendBase64FieldVariants(variants, sampleBase64Fields(fields))
+	return appendBase64FieldVariants(variants, fields)
 }
 
 // Add decoded JSON string values in stable key order
@@ -426,7 +459,41 @@ func appendBase64JSONVariants(variants []string, value string) []string {
 	}
 	fields := make([]base64Field, 0)
 	collectBase64JSONFields(document, "", &fields)
-	return appendBase64FieldVariants(variants, sampleBase64Fields(fields))
+	return appendBase64FieldVariants(variants, fields)
+}
+
+// Decode bounded multipart text fields and ignore file uploads
+func appendBase64MultipartVariants(variants []string, value, contentType string) []string {
+	_, parameters, err := mime.ParseMediaType(contentType)
+	boundary := parameters["boundary"]
+	if err != nil || boundary == "" {
+		return variants
+	}
+
+	reader := multipart.NewReader(strings.NewReader(value), boundary)
+	fields := make([]base64Field, 0)
+	remaining := maxRequestBodySize
+	for remaining > 0 {
+		part, nextErr := reader.NextPart()
+		if nextErr == io.EOF {
+			break
+		}
+		if nextErr != nil {
+			return variants
+		}
+		if part.FileName() != "" {
+			_ = part.Close()
+			continue
+		}
+		payload, readErr := io.ReadAll(io.LimitReader(part, int64(remaining+1)))
+		closeErr := part.Close()
+		if readErr != nil || closeErr != nil || len(payload) > remaining {
+			return variants
+		}
+		remaining -= len(payload)
+		fields = append(fields, base64Field{key: part.FormName(), value: string(payload)})
+	}
+	return appendBase64FieldVariants(variants, fields)
 }
 
 // Keep key context for decoded command and URL assignments
@@ -456,31 +523,24 @@ func collectBase64JSONFields(value any, key string, fields *[]base64Field) {
 	}
 }
 
-// Preserve candidates from both ends of a structured source
-func sampleBase64Fields(fields []base64Field) []base64Field {
-	if len(fields) <= maxBase64Candidates {
-		return fields
-	}
-	half := maxBase64Candidates / 2
-	sampled := make([]base64Field, 0, maxBase64Candidates)
-	sampled = append(sampled, fields[:half]...)
-	sampled = append(sampled, fields[len(fields)-(maxBase64Candidates-half):]...)
-	return sampled
-}
-
-// Append printable Base64 values within one aggregate decode budget
+// Append printable Base64 values within bounded input and output budgets
 func appendBase64FieldVariants(variants []string, fields []base64Field) []string {
 	seen := make(map[string]struct{}, len(variants))
 	for _, variant := range variants {
 		seen[variant] = struct{}{}
 	}
-	remaining := maxRequestBodySize
+	remainingInput := maxDetectionSourceSize
+	remainingOutput := maxRequestBodySize
 	for _, field := range fields {
+		if len(field.value) > remainingInput {
+			break
+		}
+		remainingInput -= len(field.value)
 		decoded, ok := decodeBase64Text(field.value)
-		if !ok || len(decoded) > remaining {
+		if !ok || len(decoded) > remainingOutput {
 			continue
 		}
-		remaining -= len(decoded)
+		remainingOutput -= len(decoded)
 		candidate := decoded
 		if field.key != "" {
 			candidate = field.key + "=" + decoded
@@ -490,6 +550,15 @@ func appendBase64FieldVariants(variants []string, fields []base64Field) []string
 		}
 	}
 	return variants
+}
+
+// Decode bounded credentials without requiring an application login
+func decodeBasicAuthorization(value string) (string, bool) {
+	scheme, token, found := strings.Cut(strings.TrimSpace(value), " ")
+	if !found || !strings.EqualFold(scheme, "basic") {
+		return "", false
+	}
+	return decodeBase64Text(token)
 }
 
 // Decode one complete textual Base64 value without recursion
@@ -585,7 +654,6 @@ func normalizeDetectionVariants(value string, plusAsSpace bool) []string {
 	seen := make(map[string]struct{}, cap(variants))
 	current := value
 	for pass := 0; pass <= maxDecodePasses; pass++ {
-		current = html.UnescapeString(current)
 		canonical := canonicalizeDetectionText(current)
 		appendUniqueVariant(&variants, seen, canonical)
 		appendUniqueVariant(&variants, seen, strings.Join(strings.Fields(canonical), " "))
@@ -593,8 +661,9 @@ func normalizeDetectionVariants(value string, plusAsSpace bool) []string {
 		if pass == maxDecodePasses {
 			break
 		}
-		decoded, changed := decodeDetectionEscapes(current, plusAsSpace)
-		if !changed || decoded == current {
+		htmlDecoded := html.UnescapeString(current)
+		decoded, escaped := decodeDetectionEscapes(htmlDecoded, plusAsSpace)
+		if htmlDecoded == current && (!escaped || decoded == htmlDecoded) {
 			break
 		}
 		current = decoded
@@ -604,6 +673,7 @@ func normalizeDetectionVariants(value string, plusAsSpace bool) []string {
 
 // Normalize case and common separator lookalikes while keeping newlines
 func canonicalizeDetectionText(value string) string {
+	value = normalizeLegacyUTF8Separators(value)
 	value = strings.ToValidUTF8(value, "?")
 	value = detectionRuneReplacer.Replace(value)
 	value = strings.ToLower(value)
@@ -615,7 +685,13 @@ func truncateDetectionSource(value string) string {
 	if len(value) > maxDetectionSourceSize {
 		value = value[:maxDetectionSourceSize]
 	}
+	value = normalizeLegacyUTF8Separators(value)
 	return strings.ToValidUTF8(value, "?")
+}
+
+// Recover legacy UTF8 separators before repairing invalid input
+func normalizeLegacyUTF8Separators(value string) string {
+	return legacyUTF8SeparatorReplacer.Replace(value)
 }
 
 // Keep malformed escapes and decode valid percent sequences
@@ -724,6 +800,8 @@ func firstSQLMatch(sources []detectionSource) (string, confidence) {
 	mediumPatterns := [...]*regexp.Regexp{
 		sqlNumericBooleanRegex,
 		sqlSleepRegex,
+		sqlConditionalRegex,
+		sqlHavingRegex,
 		sqlStackedRegex,
 	}
 	var mediumSource string
@@ -762,7 +840,7 @@ func firstSQLMatch(sources []detectionSource) (string, confidence) {
 // Match shell signatures with a local quote splitting variant
 func firstCommandMatch(sources []detectionSource) (string, confidence) {
 	highPatterns := []*regexp.Regexp{commandAssignmentRegex, commandSubstitutionRegex, commandStrongSeparatorRegex, commandExplicitSeparatorRegex}
-	mediumPatterns := []*regexp.Regexp{commandAmbiguousSeparatorRegex}
+	mediumPatterns := []*regexp.Regexp{commandAmbiguousSeparatorRegex, commandGenericAssignmentRegex}
 	if source, ok := firstDerivedRegexMatch(sources, highPatterns, collapseShellWordQuotes); ok {
 		return source, confidenceHigh
 	}
@@ -792,7 +870,7 @@ func firstDerivedRegexMatch(sources []detectionSource, patterns []*regexp.Regexp
 	return "", false
 }
 
-// Collapse balanced quotes only when they split one shell word
+// Collapse balanced quotes when they split or end a shell word
 func collapseShellWordQuotes(value string) string {
 	var collapsed strings.Builder
 	collapsed.Grow(len(value))
@@ -809,7 +887,14 @@ func collapseShellWordQuotes(value string) string {
 		for end < len(value) && isShellWordByte(value[end]) {
 			end++
 		}
-		if end == index+1 || end+1 >= len(value) || value[end] != quote || !isShellWordByte(value[end+1]) {
+		if end >= len(value) || value[end] != quote {
+			collapsed.WriteByte(value[index])
+			index++
+			continue
+		}
+		followedByWord := end+1 < len(value) && isShellWordByte(value[end+1])
+		followedByBoundary := end+1 == len(value) || end+1 < len(value) && isShellWordBoundary(value[end+1])
+		if !followedByWord && !followedByBoundary {
 			collapsed.WriteByte(value[index])
 			index++
 			continue
@@ -825,6 +910,11 @@ func collapseShellWordQuotes(value string) string {
 	return collapsed.String()
 }
 
+// Recognize delimiters after an unquoted shell command
+func isShellWordBoundary(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\r' || value == '\n' || strings.ContainsRune(`;&|)$`+"`<>/", rune(value))
+}
+
 // Recognize bytes accepted inside the command names we track
 func isShellWordByte(value byte) bool {
 	return value >= 'a' && value <= 'z' || value >= '0' && value <= '9' || value == '_' || value == '-'
@@ -832,7 +922,7 @@ func isShellWordByte(value byte) bool {
 
 // Keep active browser constructs above ambiguous standalone tags and schemes
 func firstXSSMatch(sources []detectionSource) (string, confidence) {
-	if source, ok := firstRegexMatch(sources, xssActiveTagRegex, xssEventHandlerRegex, xssTagEventHandlerRegex); ok {
+	if source, ok := firstRegexMatch(sources, xssActiveTagRegex, xssEventHandlerRegex, xssTagEventHandlerRegex, xssSVGAnimationHandlerRegex); ok {
 		return source, confidenceHigh
 	}
 	if source, ok := firstRegexMatch(sources, xssAmbiguousTagRegex); ok {
@@ -962,7 +1052,8 @@ func noSQLKeyConfidence(key string) confidence {
 		switch component {
 		case "$where", "$function":
 			return confidenceHigh
-		case "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$regex", "$exists":
+		case "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$regex", "$exists",
+			"$or", "$and", "$nor", "$not", "$expr", "$mod", "$size", "$all", "$elemmatch", "$type":
 			return confidenceMedium
 		}
 	}
@@ -1003,7 +1094,8 @@ func firstSSRFMatch(sources []detectionSource) (string, confidence) {
 	}
 	for _, source := range sources {
 		for _, variant := range source.variants {
-			if anyCapturedValue(variant, ssrfMediumAssignmentRegex, isLocalTarget) {
+			if anyCapturedValue(variant, ssrfHighAssignmentRegex, isPotentialLocalTarget) ||
+				anyCapturedValue(variant, ssrfMediumAssignmentRegex, isPotentialLocalTarget) {
 				return source.name, confidenceMedium
 			}
 		}
@@ -1189,19 +1281,8 @@ func anyCapturedValue(value string, pattern *regexp.Regexp, accept func(string) 
 
 // Classify URL targets without DNS lookups
 func isLocalTarget(candidate string) bool {
-	candidate = strings.TrimSpace(candidate)
-	if candidate == "" {
-		return false
-	}
-	candidate = normalizeSpecialURL(candidate)
-	if strings.HasPrefix(candidate, "//") {
-		candidate = "http:" + candidate
-	} else if !strings.Contains(candidate, "://") {
-		candidate = "http://" + candidate
-	}
-
-	parsed, err := url.Parse(candidate)
-	if err != nil {
+	parsed, ok := parseDetectionTarget(candidate)
+	if !ok {
 		return false
 	}
 	switch parsed.Scheme {
@@ -1211,8 +1292,51 @@ func isLocalTarget(candidate string) bool {
 	default:
 		return false
 	}
+	return isRecognizedLocalHost(parsed.Hostname())
+}
 
+// Accept uncommon protocols and intranet hostnames at medium confidence
+func isPotentialLocalTarget(candidate string) bool {
+	if isLocalTarget(candidate) {
+		return true
+	}
+	normalizedCandidate := normalizeSpecialURL(strings.TrimSpace(candidate))
+	parsed, ok := parseDetectionTarget(candidate)
+	if !ok || parsed.Scheme == "file" {
+		return false
+	}
 	host := strings.ToLower(strings.TrimSuffix(parsed.Hostname(), "."))
+	if isRecognizedLocalHost(host) {
+		return true
+	}
+	if host == "" {
+		return false
+	}
+	looksLikeURL := strings.Contains(normalizedCandidate, "://") || strings.Contains(normalizedCandidate, ":")
+	looksLikeMalformedNumber := strings.HasPrefix(host, "0x") || host[0] >= '0' && host[0] <= '9'
+	return looksLikeURL && !strings.Contains(host, ".") && net.ParseIP(host) == nil && !looksLikeMalformedNumber
+}
+
+// Parse URL targets consistently without resolving names
+func parseDetectionTarget(candidate string) (*url.URL, bool) {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return nil, false
+	}
+	candidate = normalizeSpecialURL(candidate)
+	if strings.HasPrefix(candidate, "//") {
+		candidate = "http:" + candidate
+	} else if !strings.Contains(candidate, "://") {
+		candidate = "http://" + candidate
+	}
+	parsed, err := url.Parse(candidate)
+	return parsed, err == nil
+}
+
+// Recognize local hosts after URL parsing
+func isRecognizedLocalHost(rawHost string) bool {
+	host := strings.ToLower(strings.TrimSuffix(rawHost, "."))
+
 	if zoneIndex := strings.LastIndexByte(host, '%'); zoneIndex >= 0 {
 		host = host[:zoneIndex]
 	}
@@ -1254,6 +1378,9 @@ func isLocalTarget(candidate string) bool {
 
 // Align special URL separators with browser and common client parsing
 func normalizeSpecialURL(candidate string) string {
+	if strings.HasPrefix(candidate, `\\`) {
+		return "//" + strings.TrimLeft(strings.ReplaceAll(candidate, `\`, "/"), "/")
+	}
 	separator := strings.IndexByte(candidate, ':')
 	if separator <= 0 {
 		return candidate
@@ -1352,7 +1479,7 @@ func isFileInclusionTarget(candidate string) bool {
 	if localFileRegex.MatchString(candidate) {
 		return true
 	}
-	if strings.HasPrefix(candidate, "//") {
+	if strings.HasPrefix(candidate, "//") || strings.HasPrefix(candidate, `\\`) {
 		return true
 	}
 	parsed, err := url.Parse(candidate)

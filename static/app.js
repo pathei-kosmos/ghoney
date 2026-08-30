@@ -84,7 +84,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }).format(date);
     }
 
-    // Express recency without implying long-term storage
+    // Express recency without implying permanent storage
     function timeAgo(value) {
         const timestamp = new Date(value).getTime();
         if (Number.isNaN(timestamp)) {

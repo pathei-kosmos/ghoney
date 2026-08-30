@@ -229,8 +229,32 @@ func readBoundedBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	return readBoundedGzipBody(body)
 }
 
-// Decode one gzip layer without allowing expansion beyond the body budget
+// Decode nested gzip layers within fixed limits
 func readBoundedGzipBody(body []byte) ([]byte, error) {
+	decoded := body
+	for layer := 0; layer < maxNestedGzipLayers; layer++ {
+		if layer > 0 && !hasGzipSignature(decoded) {
+			break
+		}
+		current, err := readSingleBoundedGzipBody(decoded)
+		if err != nil {
+			if layer == 0 {
+				return nil, err
+			}
+			break
+		}
+		decoded = current
+	}
+	return decoded, nil
+}
+
+// Recognize inner gzip data before another decoding pass
+func hasGzipSignature(body []byte) bool {
+	return len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b
+}
+
+// Decode one gzip layer within the body limit
+func readSingleBoundedGzipBody(body []byte) ([]byte, error) {
 	reader, err := gzip.NewReader(bytes.NewReader(body))
 	if err != nil {
 		return nil, fmt.Errorf("open gzip request body: %w", err)

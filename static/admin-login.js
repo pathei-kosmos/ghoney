@@ -9,7 +9,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
     }
 
-    // Bound the in-place request so the form always becomes usable again
+    // Bound the request so the form always becomes usable again
     form.addEventListener('submit', async (event) => {
         event.preventDefault();
         button.disabled = true;
