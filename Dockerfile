@@ -13,7 +13,7 @@ RUN go mod download && go mod verify
 # Copy production sources without the tests
 COPY main.go bootstrap.go detection.go server.go telemetry.go ./
 COPY static ./static
-ARG VERSION=v0.1.2
+ARG VERSION=v0.1.3
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w -X main.buildVersion=${VERSION}" \
