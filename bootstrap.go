@@ -94,9 +94,6 @@ func isLiteralLoopbackAddress(address string) bool {
 		return false
 	}
 	host = strings.TrimSpace(strings.Trim(host, "[]"))
-	if strings.EqualFold(host, "localhost") {
-		return true
-	}
 	ip := net.ParseIP(host)
 	if ip == nil {
 		return false

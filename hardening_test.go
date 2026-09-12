@@ -34,6 +34,8 @@ func TestDetectionConfidenceCoversNewFamilies(t *testing.T) {
 		{name: "extended XSS event handler", input: detectionInput{Path: "/", Body: `<div onbeforetoggle=alert(1)>`}, attackType: "XSS", confidence: confidenceHigh},
 		{name: "body XSS event handler", input: detectionInput{Path: "/", Body: `<body onload=alert(1)>`}, attackType: "XSS", confidence: confidenceHigh},
 		{name: "isolated JavaScript URI", input: detectionInput{Path: "/", RawQuery: "next=javascript%3Aalert(1)"}, attackType: "XSS", confidence: confidenceMedium},
+		{name: "Base64 HTML data URI", input: detectionInput{Path: "/", RawQuery: "q=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="}, attackType: "XSS", confidence: confidenceHigh},
+		{name: "VBScript URI", input: detectionInput{Path: "/", RawQuery: "next=vbscript%3Amsgbox(1)"}, attackType: "XSS", confidence: confidenceMedium},
 		{name: "plain JNDI lookup", input: detectionInput{Path: "/", Header: http.Header{"User-Agent": []string{`${jndi:ldap://127.0.0.1/a}`}}}, attackType: "JNDI Injection", confidence: confidenceHigh},
 		{name: "obfuscated JNDI lookup", input: detectionInput{Path: "/", RawQuery: `q=${${lower:j}${upper:n}${::-d}${::-i}:ldap://example.com/a}`}, attackType: "JNDI Injection", confidence: confidenceHigh},
 		{name: "executable JSON NoSQL operator", input: detectionInput{Path: "/", Body: `{"$where":"this.active"}`}, attackType: "NoSQL Injection", confidence: confidenceHigh},
@@ -318,13 +320,10 @@ func TestDetectionDecodesStructuredBase64Values(t *testing.T) {
 	}
 }
 
-// Bound Base64 work and avoid recursive or binary decoding
+// Bound Base64 work and avoid unstructured or binary decoding
 func TestStructuredBase64DecodingStaysConservative(t *testing.T) {
-	inner := base64.StdEncoding.EncodeToString([]byte(`<script>alert(1)</script>`))
-	doubleEncoded := base64.StdEncoding.EncodeToString([]byte(inner))
 	binary := base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 3, 4, 5, 6, 7})
 	inputs := []detectionInput{
-		{Path: "/", RawQuery: "q=" + url.QueryEscape(doubleEncoded)},
 		{Path: "/", RawQuery: "session=" + url.QueryEscape(binary)},
 		{Path: "/", Body: base64.StdEncoding.EncodeToString([]byte(`${jndi:ldap://example.com/a}`))},
 	}
@@ -350,6 +349,30 @@ func TestStructuredBase64DecodingStaysConservative(t *testing.T) {
 	fields[8] = "q=" + base64.RawURLEncoding.EncodeToString([]byte(`<script>alert(1)</script>`))
 	if detections := detectAttacks(detectionInput{Path: "/", RawQuery: strings.Join(fields[:17], "&")}); !hasDetectionType(detections, "XSS") {
 		t.Fatalf("middle Base64 candidate was not inspected: %+v", detections)
+	}
+}
+
+// Keep data URI decoding restricted to executable media and XSS classification
+func TestXSSDataURIDecodingStaysScoped(t *testing.T) {
+	activeScript := base64.StdEncoding.EncodeToString([]byte(`<script>alert(1)</script>`))
+	harmlessHTML := base64.StdEncoding.EncodeToString([]byte(`<p>Hello</p>`))
+	shellText := base64.StdEncoding.EncodeToString([]byte(`;whoami`))
+	tests := []struct {
+		name       string
+		query      string
+		prohibited string
+	}{
+		{name: "plain text media", query: "q=data:text/plain;base64," + activeScript, prohibited: "XSS"},
+		{name: "inert image media", query: "q=data:image/png;base64," + activeScript, prohibited: "XSS"},
+		{name: "harmless active document", query: "q=data:text/html;base64," + harmlessHTML, prohibited: "XSS"},
+		{name: "browser-only decoding", query: "q=data:text/html;base64," + shellText, prohibited: "Command Injection"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if detections := detectAttacks(detectionInput{Path: "/", RawQuery: test.query}); hasDetectionType(detections, test.prohibited) {
+				t.Fatalf("data URI produced prohibited %q detection: %+v", test.prohibited, detections)
+			}
+		})
 	}
 }
 
@@ -731,8 +754,8 @@ func TestBenignDetectionCorpus(t *testing.T) {
 	}
 }
 
-// Keep strong events when the buffer receives weaker ones
-func TestPriorityEvictionPreservesStrongerEvents(t *testing.T) {
+// Reserve dashboard capacity when a new confidence class appears
+func TestPartitionedEvictionAdmitsWeakSignals(t *testing.T) {
 	resetRecentLogs(t)
 	for index := 0; index < logBufferSize; index++ {
 		logEvent("warn", "192.0.2.1", "test", "/", "SQL Injection", "test", "", "", confidenceHigh)
@@ -744,15 +767,20 @@ func TestPriorityEvictionPreservesStrongerEvents(t *testing.T) {
 	if len(recentLogs) != logBufferSize {
 		t.Fatalf("buffer length = %d, want %d", len(recentLogs), logBufferSize)
 	}
+	weakFound := false
 	for _, entry := range recentLogs {
-		if entry.Confidence != confidenceHigh {
-			t.Fatalf("weak event evicted a high-confidence entry: %+v", entry)
+		if entry.Confidence == "" {
+			weakFound = true
+			break
 		}
+	}
+	if !weakFound {
+		t.Fatal("weak signal was not admitted into its reserved dashboard capacity")
 	}
 }
 
-// Evict the weakest stored event first
-func TestPriorityEvictionUsesLowestStoredConfidence(t *testing.T) {
+// Evict an overrepresented confidence class before a reserved signal
+func TestPartitionedEvictionPreservesExistingClasses(t *testing.T) {
 	resetRecentLogs(t)
 	for index := 0; index < logBufferSize; index++ {
 		value := confidenceMedium
@@ -767,10 +795,18 @@ func TestPriorityEvictionUsesLowestStoredConfidence(t *testing.T) {
 
 	logMutex.Lock()
 	defer logMutex.Unlock()
+	weakFound := false
+	highFound := false
 	for _, entry := range recentLogs {
 		if entry.Confidence == "" {
-			t.Fatalf("high-confidence event did not evict the weakest entry: %+v", entry)
+			weakFound = true
 		}
+		if entry.Confidence == confidenceHigh {
+			highFound = true
+		}
+	}
+	if !weakFound || !highFound {
+		t.Fatalf("reserved confidence classes missing: weak=%t high=%t", weakFound, highFound)
 	}
 }
 
@@ -838,7 +874,7 @@ func TestLoadConfigEnforcesAdministrativeCredentials(t *testing.T) {
 	}{
 		{name: "native IPv4 loopback", address: "127.12.3.4:9090"},
 		{name: "native IPv6 loopback", address: "[::1]:9090"},
-		{name: "localhost", address: "localhost:9090"},
+		{name: "localhost is resolved", address: "localhost:9090", wantError: true},
 		{name: "mapped address is not literal", address: "[::ffff:127.0.0.1]:9090", wantError: true},
 		{name: "wildcard missing password", address: ":9090", wantError: true},
 		{name: "wildcard authenticated", address: ":9090", password: "sixteen-byte-key!", wantAuth: true},

@@ -22,4 +22,4 @@ Bug reports and focused improvements are welcome. Please open an issue before pr
 
 Changes to `seccomp.json`, container isolation, request parsing, logging, or dashboard rendering must include a regression test or an integration check.
 
-The module supports Go 1.25 and newer.
+The module requires Go 1.26.8 or newer.

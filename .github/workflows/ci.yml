@@ -13,19 +13,16 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    strategy:
-      # Check the minimum and image build versions
-      matrix:
-        go-version: ["1.25.x", "1.26.7"]
-
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        # Pin third-party workflow code while Dependabot tracks v6 updates
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Set up Go
-        uses: actions/setup-go@v7
+        # Pin third-party workflow code while Dependabot tracks v7 updates
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7
         with:
-          go-version: ${{ matrix.go-version }}
+          go-version: "1.26.8"
           cache: true
           cache-dependency-path: go.sum
 
@@ -49,7 +46,8 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v6
+        # Use the same reviewed checkout revision in every job
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Build hardened image
         run: docker build -t ghoney:ci .

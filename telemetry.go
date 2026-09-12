@@ -21,7 +21,7 @@ var structuredLogger = log.New(os.Stdout, "", 0)
 // Keep log output clean and register metrics once
 func init() {
 	log.SetFlags(0)
-	metricsRegistry.MustRegister(httpRequestsTotal, honeypotAttacksTotal, honeypotDetectionsTotal)
+	metricsRegistry.MustRegister(httpRequestsTotal, honeypotAttacksTotal, honeypotDetectionsTotal, eventsDroppedTotal)
 }
 
 // Repair UTF8 before applying the byte limit
@@ -82,20 +82,56 @@ func logEvent(level, ip, userAgent, path, attackType, details, rawQuery, bodySni
 		recentLogs = append(recentLogs, entry)
 		return
 	}
-	// Replace the oldest weak event only when the new one is as useful
-	lowestIndex := 0
-	lowestRank := confidenceRank(recentLogs[0].Confidence)
-	for index := 1; index < len(recentLogs); index++ {
-		if rank := confidenceRank(recentLogs[index].Confidence); rank < lowestRank {
-			lowestIndex = index
-			lowestRank = rank
+	// Reserve capacity per confidence so one noisy class cannot erase the others
+	evictionIndex := dashboardEvictionIndex(entry.Confidence)
+	eventsDroppedTotal.WithLabelValues(confidenceMetricLabel(recentLogs[evictionIndex].Confidence)).Inc()
+	copy(recentLogs[evictionIndex:], recentLogs[evictionIndex+1:])
+	recentLogs[len(recentLogs)-1] = entry
+}
+
+// Choose the oldest event from the new class or a class above its reservation
+func dashboardEvictionIndex(incoming confidence) int {
+	counts := map[confidence]int{
+		confidenceHigh:   0,
+		confidenceMedium: 0,
+		"":               0,
+	}
+	for _, entry := range recentLogs {
+		counts[entry.Confidence]++
+	}
+	if counts[incoming] >= dashboardConfidenceReserve(incoming) {
+		for index, entry := range recentLogs {
+			if entry.Confidence == incoming {
+				return index
+			}
 		}
 	}
-	if confidenceRank(entry.Confidence) < lowestRank {
-		return
+	for index, entry := range recentLogs {
+		if counts[entry.Confidence] > dashboardConfidenceReserve(entry.Confidence) {
+			return index
+		}
 	}
-	copy(recentLogs[lowestIndex:], recentLogs[lowestIndex+1:])
-	recentLogs[len(recentLogs)-1] = entry
+	return 0
+}
+
+// Keep the dashboard capacity split explicit and exhaustive
+func dashboardConfidenceReserve(value confidence) int {
+	switch value {
+	case confidenceHigh:
+		return logHighReserve
+	case confidenceMedium:
+		return logMediumReserve
+	default:
+		return logWeakReserve
+	}
+}
+
+// Export empty-confidence access events under a stable Prometheus label
+func confidenceMetricLabel(value confidence) string {
+	if value == "" {
+		return "none"
+	}
+	return string(value)
 }
 
 // Keep confidence ordering in one place
@@ -232,18 +268,26 @@ func readBoundedBody(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 // Decode nested gzip layers within fixed limits
 func readBoundedGzipBody(body []byte) ([]byte, error) {
 	decoded := body
+	decodedWork := 0
 	for layer := 0; layer < maxNestedGzipLayers; layer++ {
 		if layer > 0 && !hasGzipSignature(decoded) {
-			break
+			return decoded, nil
 		}
 		current, err := readSingleBoundedGzipBody(decoded)
 		if err != nil {
 			if layer == 0 {
 				return nil, err
 			}
-			break
+			return decoded, nil
+		}
+		decodedWork += len(current)
+		if decodedWork > maxGzipDecodedWorkSize {
+			return nil, &http.MaxBytesError{Limit: int64(maxGzipDecodedWorkSize)}
 		}
 		decoded = current
+	}
+	if hasGzipSignature(decoded) {
+		return nil, fmt.Errorf("nested gzip body exceeds %d layers", maxNestedGzipLayers)
 	}
 	return decoded, nil
 }

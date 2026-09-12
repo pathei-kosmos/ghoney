@@ -1,8 +1,7 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1@sha256:ecfaec9ed6d810b56388c508f4121597bfbba70d41a6dfeee4d8cad5f295fc32
 
-# Build with the toolchain checked in CI
-ARG GO_VERSION=1.26.7
-FROM golang:${GO_VERSION}-alpine AS builder
+# Pin the multi-platform toolchain manifest verified by Dependabot
+FROM golang:1.26.8-alpine@sha256:ce864e7223ac17b1775e6fd0b4c0db580c2eb50e7953a427916379e4b92a1628 AS builder
 
 WORKDIR /src
 
@@ -11,17 +10,18 @@ COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 
 # Copy production sources without the tests
-COPY main.go bootstrap.go detection.go server.go telemetry.go ./
+COPY main.go assets.go bootstrap.go config.go http_helpers.go server.go telemetry.go telemetry_state.go ./
+COPY detection.go detection_injections.go detection_normalization.go detection_signatures.go detection_targets.go ./
 COPY static ./static
-ARG VERSION=v0.1.3
+ARG VERSION=v0.1.4
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w -X main.buildVersion=${VERSION}" \
     -o /out/ghoney \
     .
 
-# Ship only the static binary
-FROM gcr.io/distroless/static-debian13:nonroot
+# Pin the multi-platform runtime manifest verified by Dependabot
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7
 
 COPY --from=builder --chown=nonroot:nonroot /out/ghoney /ghoney
 

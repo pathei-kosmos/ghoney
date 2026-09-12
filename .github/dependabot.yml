@@ -1,0 +1,24 @@
+version: 2
+
+# Keep pinned workflow commits current through reviewed pull requests
+updates:
+  # Keep one version update open per ecosystem, for three concurrent PRs overall
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 1
+
+  # Refresh pinned base-image digests without making builds mutable
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 1
+
+  # Surface vulnerable or stale Go dependencies through the same review path
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 1

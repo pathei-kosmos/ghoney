@@ -12,7 +12,7 @@
 **A small HTTP honeypot for the noisy parts of the internet.**
 
 <p>
-  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.25%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.25 or newer"></a>
+  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.26.8%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.26.8 or newer"></a>
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready"></a>
   <a href="https://github.com/pathei-kosmos/ghoney/actions/workflows/ci.yml"><img src="https://github.com/pathei-kosmos/ghoney/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-black.svg" alt="MIT License"></a>
@@ -25,20 +25,23 @@
 ## ✨ What it catches
 
 - SQL injection, path traversal, command injection, SSRF, LFI/RFI, and XML entity attacks
-- XSS, JNDI/Log4Shell, and NoSQL injection
-- Percent-encoded and obfuscated payloads across URLs, request bodies, and selected headers
-- Nested gzip request bodies and Base64 values in query, form, JSON, multipart text, and Basic Authorization fields
+- XSS through active tags, event handlers, script URI schemes, and Base64 `data:` documents
+- JNDI/Log4Shell and NoSQL injection
+- Percent, HTML entity, Unicode, and shell-obfuscated payloads across paths, query strings, request bodies, and selected headers
+- Nested gzip bodies, UTF-16/32 request bodies, and bounded recursive Base64 values in query, form, JSON, multipart text, and Basic Authorization fields
 - Requests to decoy routes such as `/admin`, `/api/v1/auth`, and `/.git/config`
 
 Detections have `high` or `medium` confidence. Strong signals are logged at `warn`, while ambiguous ones stay at `info`. A request produces at most one event per attack family.
 
-Request bodies are limited to 4 KiB before and after gzip decompression, with `413` returned above either limit. Metric labels and concurrency are also bounded. The memory buffer holds at most 100 events and preserves stronger signals when it fills up.
+Request bodies are limited to 4 KiB before and after gzip decompression, with `413` returned above either limit. Nested decoding also has fixed depth and aggregate-work budgets. Metric labels and concurrency are bounded. The memory buffer holds at most 100 events and reserves capacity for high-, medium-, and access-level signals so one confidence class cannot erase the others.
 
 The Git lure uses a random fake token under the reserved `.example.com` namespace, so it never points at a real external service. CMS routes and scanner fingerprinting remain outside the scope of this small honeypot.
 
 ## 🚀 Quick start
 
 You need Git and a running Docker Engine. Replace the example admin password before starting the container.
+
+Local builds and tests require Go 1.26.8 or newer. Docker builds use the pinned Go 1.26.8 toolchain included by the builder image.
 
 ```bash
 git clone https://github.com/pathei-kosmos/ghoney.git
@@ -72,6 +75,8 @@ The public and administrative listeners accept these environment variables:
 
 Authentication protects `/dashboard`, its assets, `/api/dashboard-data`, and `/metrics`. `/health` stays public for probes. **Basic Auth controls access but does not encrypt traffic. Keep the admin port on host loopback or place every network connection behind HTTPS, an SSH tunnel, or another trusted encrypted transport.**
 
+When remote administration is unavoidable, terminate TLS at a trusted reverse proxy and configure authentication rate limiting and HSTS there. ghoney does not infer proxy headers or emit HSTS over its native clear-text listener, because doing so would neither encrypt Basic credentials nor establish a trustworthy HTTPS boundary.
+
 ## 🧪 Verify detection
 
 Together, these requests generate at least one event for every supported attack family:
@@ -97,7 +102,7 @@ curl --user ghoney http://localhost:9090/api/dashboard-data
 docker logs ghoney_server
 ```
 
-`ghoney_honeypot_attacks_total` keeps its original labels. `ghoney_honeypot_detections_total` adds the bounded `confidence` label. Prometheus can authenticate directly:
+`ghoney_honeypot_attacks_total` keeps its original labels. `ghoney_honeypot_detections_total` adds the bounded `confidence` label. `ghoney_events_dropped_total` counts dashboard buffer evictions by confidence. Stdout logs and detection counters remain available after dashboard eviction. Prometheus can authenticate directly:
 
 ```yaml
 scrape_configs:
