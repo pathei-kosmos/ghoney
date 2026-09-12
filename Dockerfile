@@ -9,16 +9,14 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download && go mod verify
 
-# Copy production sources without the tests
-COPY main.go assets.go bootstrap.go config.go http_helpers.go server.go telemetry.go telemetry_state.go ./
-COPY detection.go detection_injections.go detection_normalization.go detection_signatures.go detection_targets.go ./
-COPY static ./static
+# Copy the application package and its embedded assets
+COPY cmd/ghoney ./cmd/ghoney
 ARG VERSION=v0.1.4
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w -X main.buildVersion=${VERSION}" \
     -o /out/ghoney \
-    .
+    ./cmd/ghoney
 
 # Pin the multi-platform runtime manifest verified by Dependabot
 FROM gcr.io/distroless/static-debian13:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7

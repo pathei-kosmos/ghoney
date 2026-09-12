@@ -41,7 +41,7 @@ The Git lure uses a random fake token under the reserved `.example.com` namespac
 
 You need Git and a running Docker Engine. Replace the example admin password before starting the container.
 
-Local builds and tests require Go 1.26.8 or newer. Docker builds use the pinned Go 1.26.8 toolchain included by the builder image.
+Local builds and tests require Go 1.26.8 or newer. The executable lives in `cmd/ghoney`, so a local build uses `go build ./cmd/ghoney`. Docker builds use the pinned Go 1.26.8 toolchain included by the builder image.
 
 ```bash
 git clone https://github.com/pathei-kosmos/ghoney.git

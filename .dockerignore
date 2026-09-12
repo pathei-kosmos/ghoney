@@ -9,6 +9,7 @@ seccomp.json
 # Exclude local tooling and build output
 .idea
 .vscode
+**/*_test.go
 *.exe
 *.test
 coverage.out
