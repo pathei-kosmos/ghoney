@@ -12,7 +12,7 @@
 **A small HTTP honeypot for the noisy parts of the internet.**
 
 <p>
-  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.26.8%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.26.8 or newer"></a>
+  <a href="https://go.dev/"><img src="https://img.shields.io/badge/Go-1.27.3%2B-00ADD8?logo=go&logoColor=white" alt="Go 1.27.3 or newer"></a>
   <a href="https://www.docker.com/"><img src="https://img.shields.io/badge/Docker-ready-2496ED?logo=docker&logoColor=white" alt="Docker ready"></a>
   <a href="https://github.com/pathei-kosmos/ghoney/actions/workflows/ci.yml"><img src="https://github.com/pathei-kosmos/ghoney/actions/workflows/ci.yml/badge.svg" alt="CI status"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-black.svg" alt="MIT License"></a>
@@ -37,7 +37,7 @@ Detections have `high` or `medium` confidence. Strong signals are logged at `war
 
 You need Git and a running Docker Engine. Replace the example admin password before starting the container.
 
-Local builds and tests require Go 1.26.8 or newer. The executable lives in `cmd/ghoney`, so a local build uses `go build ./cmd/ghoney`. Docker builds use the pinned Go 1.26.8 toolchain included by the builder image.
+Local builds and tests require Go 1.27.3 or newer. The executable lives in `cmd/ghoney`, so a local build uses `go build ./cmd/ghoney`. Docker builds use the pinned Go 1.27.3 toolchain included by the builder image.
 
 ```bash
 git clone https://github.com/pathei-kosmos/ghoney.git

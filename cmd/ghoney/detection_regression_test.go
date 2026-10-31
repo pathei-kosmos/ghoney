@@ -64,6 +64,7 @@ func TestDetectionCoversFieldVariants(t *testing.T) {
 		confidence confidence
 	}{
 		{"binary text run", detectionInput{Body: "1 OR 1=1" + strings.Repeat("\x00", 40)}, "SQL Injection", confidenceMedium},
+		{"invalid gzip prefix", detectionInput{Body: "\x1f\x8bq=;whoami"}, "Command Injection", confidenceHigh},
 		{"binary upload with SQL field", multipartDetectionFixture(t, "a.bin", "1 union select"), "SQL Injection", confidenceHigh},
 		{"original upload filename", multipartDetectionFixture(t, "../../etc/passwd", "safe"), "Path Traversal", confidenceHigh},
 		{"long header middle", detectionInput{Header: http.Header{"User-Agent": {strings.Repeat("a", 1500) + " 1 union select " + strings.Repeat("b", 1500)}}}, "SQL Injection", confidenceHigh},

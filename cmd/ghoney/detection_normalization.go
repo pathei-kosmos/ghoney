@@ -58,6 +58,12 @@ func buildDetectionSourcesContext(ctx context.Context, input detectionInput) []d
 	appendSource("query string", "", input.RawQuery, true)
 	appendFields("query string", detectionParameterFields(truncateDetectionSource(input.RawQuery)), true)
 	body := input.Body[:min(len(input.Body), maxRequestBodySize)]
+	// Keep valid undeclared gzip streams out of text matching
+	if hasGzipSignature([]byte(body)) {
+		if _, err := readSingleBoundedGzipBody([]byte(body)); err == nil {
+			body = ""
+		}
+	}
 	contentType := input.Header.Get("Content-Type")
 	switch {
 	case isMultipartContentType(contentType):

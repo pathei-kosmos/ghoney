@@ -711,7 +711,22 @@ func TestRequestInspectionHandlesNestedGzipBodies(t *testing.T) {
 // Ignore undeclared compressed bytes instead of classifying binary coincidences
 func TestRequestInspectionIgnoresUndeclaredNestedGzip(t *testing.T) {
 	resetRecentLogs(t)
-	rawBody := gzipTestBody(t, string(gzipTestBody(t, `q=;whoami`)))
+	// Stored blocks keep the payload visible regardless of compressor changes
+	rawBody := []byte(`q=;whoami`)
+	for range 2 {
+		var body bytes.Buffer
+		writer, err := gzip.NewWriterLevel(&body, gzip.NoCompression)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(rawBody); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		rawBody = body.Bytes()
+	}
 	request := httptest.NewRequest(http.MethodPost, "http://example.test/", bytes.NewReader(rawBody))
 	response := httptest.NewRecorder()
 	requestInspectionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
