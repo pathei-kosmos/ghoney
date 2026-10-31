@@ -13,3 +13,16 @@ seccomp.json
 *.exe
 *.test
 coverage.out
+
+# Keep local credentials out of the build context
+.env
+.env.*
+**/.env
+**/.env.*
+**/*.key
+**/*.pem
+secrets
+**/secrets
+*.log
+coverage*.out
+.gitleaksignore

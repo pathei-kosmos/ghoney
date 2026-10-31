@@ -6,7 +6,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const TOP_IP_LIMIT = 5;
     const ATTACK_TYPE_LIMIT = 9;
     const INDICATOR_LIMIT = 16;
-    // Keep payload indicators explicit and locally evaluated
+    // Match payload indicators in the browser
     const PAYLOAD_INDICATORS = [
         { label: '/etc/passwd', pattern: /\/etc\/passwd/i },
         { label: '../', pattern: /\.\.[/\\]/ },
@@ -84,7 +84,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }).format(date);
     }
 
-    // Express recency without implying permanent storage
+    // Show time since the event
     function timeAgo(value) {
         const timestamp = new Date(value).getTime();
         if (Number.isNaN(timestamp)) {
@@ -199,6 +199,13 @@ document.addEventListener('DOMContentLoaded', () => {
         if (hasBody) {
             expanded.appendChild(eventDetail('Body', log.bodySnippet, hasQuery ? 3 : 2));
         }
+        // Evidence stays visible when the raw prefix was truncated
+        if (log.sample) {
+            expanded.appendChild(eventDetail(`Sample (${log.source || 'input'})`, log.sample, 3));
+        }
+        if (log.method) {
+            expanded.appendChild(eventDetail('Method', log.method));
+        }
         cell.appendChild(expanded);
         row.appendChild(cell);
         return row;
@@ -215,7 +222,7 @@ document.addEventListener('DOMContentLoaded', () => {
         summary.textContent = String(log.details ?? '');
         detailContent.appendChild(summary);
 
-        [['Query', log.rawQuery], ['Body', log.bodySnippet]].forEach(([label, value]) => {
+        [['Sample', log.sample], ['Query', log.rawQuery], ['Body', log.bodySnippet]].forEach(([label, value]) => {
             if (!value) {
                 return;
             }
@@ -246,6 +253,9 @@ document.addEventListener('DOMContentLoaded', () => {
         if (log.bodySnippet) {
             actions.appendChild(copyButton('body', log.bodySnippet));
         }
+        if (log.sample) {
+            actions.appendChild(copyButton('sample', log.sample));
+        }
         const layout = document.createElement('div');
         layout.className = 'event-detail-layout';
         layout.append(detailContent, actions);
@@ -265,7 +275,7 @@ document.addEventListener('DOMContentLoaded', () => {
         return cell;
     }
 
-    // Map known families to a fixed visual palette
+    // Use a fixed color for each attack family
     function attackTone(value) {
         const tones = {
             'LFI/RFI': 'red',
@@ -376,9 +386,9 @@ document.addEventListener('DOMContentLoaded', () => {
         return decoded;
     }
 
-    // Keep signal extraction tied to captured input
+    // Combine decoded query and body text with the matched sample
     function payloadText(log) {
-        return `${decodePayload(log.rawQuery)} ${decodePayload(log.bodySnippet)}`;
+        return `${decodePayload(log.rawQuery)} ${decodePayload(log.bodySnippet)} ${log.sample || ''}`;
     }
 
     // Identify one retained event across polling refreshes
@@ -390,7 +400,9 @@ document.addEventListener('DOMContentLoaded', () => {
             log.path,
             log.attackType,
             log.rawQuery,
-            log.bodySnippet
+            log.bodySnippet,
+            log.source,
+            log.sample
         ].map((value) => String(value ?? '')).join('\u001f');
     }
 
@@ -621,7 +633,7 @@ document.addEventListener('DOMContentLoaded', () => {
         renderKeywords(extractKeywords(detections));
     }
 
-    // Surface polling failures without clearing existing data
+    // Show polling errors without clearing existing data
     function setConnectionStatus(message, failed = false) {
         elements.statusLabel.textContent = message;
         elements.status.classList.toggle('status-error', failed);

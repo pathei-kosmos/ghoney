@@ -157,7 +157,7 @@ textarea {
     padding: 18px;
 }
 
-/* Real summary values replace decorative counters */
+/* Show event counts in summary cards */
 .stats-grid {
     display: grid;
     grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -733,7 +733,7 @@ textarea {
     text-align: center !important;
 }
 
-/* Ranked panels use native progress elements for CSP safe bars */
+/* Use native progress bars to comply with CSP */
 .rank-list {
     display: grid;
     gap: 10px;
@@ -1019,7 +1019,7 @@ textarea {
     }
 }
 
-/* Preserve detail space before the tablet layout takes over */
+/* Leave room for event details above tablet widths */
 @media (min-width: 1181px) and (max-width: 1550px) {
     .content-grid {
         grid-template-columns: minmax(0, 1fr) 340px;
@@ -1056,7 +1056,7 @@ textarea {
     }
 }
 
-/* Stack the subtitle before the three header zones begin to collide */
+/* Stack the subtitle when the header gets crowded */
 @media (max-width: 1050px) {
     .topbar {
         grid-template-columns: 1fr auto;

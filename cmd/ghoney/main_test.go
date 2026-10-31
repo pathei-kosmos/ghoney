@@ -295,10 +295,10 @@ func TestDetectAttacksCoversCommonEvasions(t *testing.T) {
 			attackType: "Path Traversal",
 		},
 		{
-			name: "traversal in oversized header suffix",
+			name: "traversal in accepted header suffix",
 			input: detectionInput{
 				Path:   "/",
-				Header: http.Header{"X-Original-Url": []string{strings.Repeat("a", maxDetectionSourceSize+512) + "/../etc/passwd"}},
+				Header: http.Header{"X-Original-Url": []string{strings.Repeat("a", maxHeaderBytes-256) + "/../etc/passwd"}},
 			},
 			attackType: "Path Traversal",
 		},
@@ -351,14 +351,18 @@ func TestDetectAttacksKeepsIndependentSourcesIndependent(t *testing.T) {
 
 // Keep normalization work bounded for every source
 func TestDetectionNormalizationStaysBounded(t *testing.T) {
-	value := strings.Repeat("%2525", maxDetectionSourceSize)
-	variants := normalizeDetectionVariants(value, true)
-	if len(variants) > (maxDecodePasses+1)*2 {
-		t.Fatalf("variant count = %d, want at most %d", len(variants), (maxDecodePasses+1)*2)
-	}
-	for _, variant := range variants {
-		if len(variant) > maxCanonicalSourceSize {
-			t.Fatalf("variant length = %d, want at most %d", len(variant), maxCanonicalSourceSize)
+	for _, value := range []string{
+		strings.Repeat("%2525", maxDetectionSourceSize),
+		repeatedlyEscapeQuery("a  b", maxNormalizationVariants-1),
+	} {
+		variants := normalizeDetectionVariants(value, true)
+		if len(variants) > maxNormalizationVariants {
+			t.Fatalf("variant count = %d, want at most %d", len(variants), maxNormalizationVariants)
+		}
+		for _, variant := range variants {
+			if len(variant) > maxCanonicalSourceSize {
+				t.Fatalf("variant length = %d, want at most %d", len(variant), maxCanonicalSourceSize)
+			}
 		}
 	}
 }

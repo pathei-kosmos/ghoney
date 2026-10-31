@@ -11,7 +11,7 @@ RUN go mod download && go mod verify
 
 # Copy the application package and its embedded assets
 COPY cmd/ghoney ./cmd/ghoney
-ARG VERSION=v0.1.4
+ARG VERSION=v0.1.5
 RUN CGO_ENABLED=0 GOOS=linux go build \
     -trimpath \
     -ldflags="-s -w -X main.buildVersion=${VERSION}" \

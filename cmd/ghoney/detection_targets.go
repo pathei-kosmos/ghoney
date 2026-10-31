@@ -8,53 +8,100 @@ import (
 	"strings"
 )
 
-// Inspect structured and transcoded sources for XML attack constructs
-func firstXMLMatch(sources []detectionSource) (string, bool) {
+// Find XML entity and include probes
+func firstXMLMatch(sources []detectionSource) (detectionMatch, bool) {
 	for _, source := range sources {
 		for _, variant := range source.variants {
+			if source.expired() {
+				break
+			}
+			if !strings.Contains(variant, "<") {
+				continue
+			}
 			if isXMLAttack(variant) || source.name == "decoded JSON body" && isXMLAttack(strings.ReplaceAll(variant, `\"`, `"`)) {
-				return source.name, true
+				return evidenceMatch(source.name, variant, max(0, strings.Index(variant, "<!"))), true
 			}
 		}
 	}
-	return "", false
+	return detectionMatch{}, false
 }
 
 // Match explicit and ambiguous URL sinks at separate confidence levels
-func firstSSRFMatch(sources []detectionSource) (string, confidence) {
+func firstSSRFMatch(sources []detectionSource) (detectionMatch, confidence) {
+	sources = sourcesWithMarker(sources, hasTargetMarker)
 	for _, source := range sources {
 		for _, variant := range source.variants {
-			if anyCapturedValue(variant, ssrfHighAssignmentRegex, isLocalTarget) {
-				return source.name, confidenceHigh
+			if source.expired() {
+				break
+			}
+			if offset := capturedValueOffset(variant, ssrfHighAssignmentRegex, isLocalTarget); offset >= 0 {
+				return evidenceMatch(source.name, variant, offset), confidenceHigh
 			}
 		}
 	}
 	for _, source := range sources {
 		for _, variant := range source.variants {
-			if anyCapturedValue(variant, ssrfHighAssignmentRegex, isPotentialLocalTarget) ||
-				anyCapturedValue(variant, ssrfMediumAssignmentRegex, isPotentialLocalTarget) {
-				return source.name, confidenceMedium
+			if source.expired() {
+				break
 			}
-		}
-	}
-	return "", ""
-}
-
-// Match sensitive paths, wrappers and remote includes
-func firstFileInclusionMatch(sources []detectionSource) (string, bool) {
-	for _, source := range sources {
-		for _, variant := range source.variants {
-			for _, pattern := range [...]*regexp.Regexp{fileAssignmentRegex, fileJSONAssignmentRegex} {
-				if anyCapturedValue(variant, pattern, isFileInclusionTarget) {
-					return source.name, true
+			for _, pattern := range []*regexp.Regexp{ssrfHighAssignmentRegex, ssrfMediumAssignmentRegex, directURLTargetRegex} {
+				if pattern == directURLTargetRegex && source.name == "decoded JSON body" {
+					continue
+				}
+				if offset := capturedValueOffset(variant, pattern, isPotentialLocalTarget); offset >= 0 {
+					return evidenceMatch(source.name, variant, offset), confidenceMedium
 				}
 			}
-			if allowsDirectFileProbe(source.name) && hasDirectLocalFileProbe(variant, source.name == "request body") {
-				return source.name, true
+		}
+	}
+	return detectionMatch{}, ""
+}
+
+// Match contextual file targets before ambiguous remote include probes
+func firstFileInclusionMatch(sources []detectionSource) (detectionMatch, confidence) {
+	sources = sourcesWithMarker(sources, func(value string) bool { return strings.ContainsAny(value, "/\\.:") })
+	for _, source := range sources {
+		for _, variant := range source.variants {
+			if source.expired() {
+				break
+			}
+			for _, pattern := range []*regexp.Regexp{fileAssignmentRegex, fileJSONAssignmentRegex} {
+				if offset := capturedValueOffset(variant, pattern, isFileInclusionTarget); offset >= 0 {
+					return evidenceMatch(source.name, variant, offset), confidenceHigh
+				}
+			}
+			if offset := directLocalFileProbeOffset(variant, strings.Contains(source.name, "body")); offset >= 0 {
+				return evidenceMatch(source.name, variant, offset), confidenceHigh
 			}
 		}
 	}
-	return "", false
+	for _, source := range sources {
+		for _, variant := range source.variants {
+			if source.expired() {
+				break
+			}
+			if offset := capturedValueOffset(variant, remoteFileURLRegex, isRemoteFileInclusionTarget); offset >= 0 {
+				return evidenceMatch(source.name, variant, offset), confidenceMedium
+			}
+		}
+	}
+	return detectionMatch{}, ""
+}
+
+// Skip fields without target markers
+func hasTargetMarker(value string) bool {
+	if ssrfShortParameterRegex.MatchString(value) {
+		return true
+	}
+	if strings.ContainsAny(value, ":./\\") {
+		return true
+	}
+	for _, marker := range []string{"url", "uri", "link", "redirect", "next", "target", "dest", "callback", "continue", "return", "endpoint", "proxy", "fetch", "webhook", "remote", "host", "src", "image", "img", "feed", "u=", "site", "load", "ref", "goto", "r=", "open"} {
+		if strings.Contains(value, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 // Recognize external XML features and large entity expansion
@@ -86,11 +133,26 @@ func hasDangerousEntityExpansion(value string) bool {
 	states := make(map[string]uint8, len(definitions))
 	sizes := make(map[string]int, len(definitions))
 	for name := range definitions {
-		if _, dangerous := expandedEntitySize(name, definitions, states, sizes); dangerous {
+		expandedSize, dangerous := expandedEntitySize(name, definitions, states, sizes)
+		if dangerous || expandedSize >= minXMLExpansionSignalSize && expandedSize >= len(definitions[name])*4 {
 			return true
 		}
 	}
 	return false
+}
+
+// Accept remote file URL schemes
+func isRemoteFileInclusionTarget(candidate string) bool {
+	parsed, err := url.Parse(strings.TrimSpace(candidate))
+	if err != nil || parsed.Hostname() == "" {
+		return false
+	}
+	switch strings.ToLower(parsed.Scheme) {
+	case "http", "https", "ftp", "tftp":
+		return true
+	default:
+		return false
+	}
 }
 
 // Measure one entity expansion with cycle detection
@@ -149,18 +211,7 @@ func addXMLExpansionSize(size, addition int) (int, bool) {
 	return size + addition, false
 }
 
-// Check direct probes only where a target path makes sense
-func allowsDirectFileProbe(source string) bool {
-	switch source {
-	case "request path", "query string", "request body",
-		"X-Original-URL header", "X-Rewrite-URL header":
-		return true
-	default:
-		return false
-	}
-}
-
-// Recognize every command shape when another detector excludes overlap
+// Avoid counting command arguments as file probes
 func hasCommandExecutionPattern(value string) bool {
 	for _, pattern := range [...]*regexp.Regexp{
 		commandAmbiguousSeparatorRegex,
@@ -177,43 +228,43 @@ func hasCommandExecutionPattern(value string) bool {
 }
 
 // Match local targets outside command and XML contexts
-func hasDirectLocalFileProbe(value string, body bool) bool {
+func directLocalFileProbeOffset(value string, body bool) int {
 	if body && isXMLAttack(value) {
-		return false
+		return -1
 	}
 	for offset := 0; offset < len(value); {
 		match := localFileRegex.FindStringIndex(value[offset:])
 		if match == nil {
-			return false
+			return -1
 		}
 		start := offset + match[0]
 		end := offset + match[1]
 		contextStart := strings.LastIndexAny(value[:start], "&,") + 1
 		context := value[contextStart:end]
 		if !pathTraversalRegex.MatchString(context) && !hasCommandExecutionPattern(context) {
-			return true
+			return start
 		}
 		offset = end
 	}
-	return false
+	return -1
 }
 
 // Scan every capture without keeping a large match slice
-func anyCapturedValue(value string, pattern *regexp.Regexp, accept func(string) bool) bool {
+func capturedValueOffset(value string, pattern *regexp.Regexp, accept func(string) bool) int {
 	for offset := 0; offset < len(value); {
 		match := pattern.FindStringSubmatchIndex(value[offset:])
 		if match == nil {
-			return false
+			return -1
 		}
 		if len(match) >= 4 && match[2] >= 0 && accept(value[offset+match[2]:offset+match[3]]) {
-			return true
+			return offset + match[2]
 		}
 		if match[1] <= 0 {
-			return false
+			return -1
 		}
 		offset += match[1]
 	}
-	return false
+	return -1
 }
 
 // Classify URL targets without DNS lookups
@@ -271,7 +322,7 @@ func nestedJARTarget(candidate string) string {
 	return nested
 }
 
-// Recognize non-public benchmark and documentation networks as ambiguous SSRF targets
+// Recognize special-use IPv4 ranges
 func isReservedDetectionHost(host string) bool {
 	ip := net.ParseIP(host)
 	if ip == nil {
@@ -284,7 +335,9 @@ func isReservedDetectionHost(host string) bool {
 	if ipv4 == nil {
 		return false
 	}
-	return ipv4[0] == 198 && ipv4[1]&0xfe == 18 ||
+	return ipv4[0] == 192 && ipv4[1] == 0 && ipv4[2] == 0 && ipv4[3] != 9 && ipv4[3] != 10 ||
+		ipv4[0] >= 240 ||
+		ipv4[0] == 198 && ipv4[1]&0xfe == 18 ||
 		ipv4[0] == 192 && ipv4[1] == 0 && ipv4[2] == 2 ||
 		ipv4[0] == 198 && ipv4[1] == 51 && ipv4[2] == 100 ||
 		ipv4[0] == 203 && ipv4[1] == 0 && ipv4[2] == 113
@@ -373,7 +426,7 @@ func normalizeSpecialURL(candidate string) string {
 func isLocalIP(ip net.IP) bool {
 	if ipv4 := ip.To4(); ipv4 != nil {
 		ip = ipv4
-		if ipv4[0] == 100 && ipv4[1]&0xc0 == 0x40 {
+		if ipv4[0] == 100 && ipv4[1]&0xc0 == 0x40 || ipv4[0] == 0 {
 			return true
 		}
 	}

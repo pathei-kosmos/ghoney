@@ -1,2 +1,22 @@
 # Ignore the local binary produced by go build
 /ghoney
+
+# Keep local credentials and private key material out of version control
+.env
+.env.*
+!.env.example
+!.env.*.example
+*.key
+*.pem
+/secrets/
+
+# Ignore local test output, runtime logs, and editor state
+*.test
+*.exe
+coverage.out
+coverage*.out
+*.log
+.idea/
+.vscode/
+*.swp
+*.swo

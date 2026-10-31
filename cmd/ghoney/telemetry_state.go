@@ -18,6 +18,9 @@ type LogEntry struct {
 	Details     string     `json:"details"`
 	RawQuery    string     `json:"rawQuery"`
 	BodySnippet string     `json:"bodySnippet"`
+	Method      string     `json:"method,omitempty"`
+	Source      string     `json:"source,omitempty"`
+	Sample      string     `json:"sample,omitempty"`
 }
 
 var (
@@ -45,6 +48,13 @@ var (
 			Help: "Total detection events grouped by bounded attack type, route, and confidence.",
 		},
 		[]string{"attack_type", "route", "confidence"},
+	)
+	stdoutEventsDroppedTotal = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "ghoney_stdout_events_dropped_total",
+			Help: "Total stdout events lost to queue saturation, shutdown, or write errors.",
+		},
+		[]string{"reason"},
 	)
 	eventsDroppedTotal = prometheus.NewCounterVec(
 		prometheus.CounterOpts{

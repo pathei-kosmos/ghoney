@@ -23,4 +23,6 @@ Bug reports and focused improvements are welcome. Please open an issue before pr
 
 Changes to `seccomp.json`, container isolation, request parsing, logging, or dashboard rendering must include a regression test or an integration check.
 
+The two entries in [.gitleaksignore](.gitleaksignore) cover a fake GitLab token and an expired example JWT. Each exception applies only to its exact historical fingerprint, with all rules kept enabled for new content.
+
 The module requires Go 1.26.8 or newer.

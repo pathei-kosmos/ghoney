@@ -17,34 +17,39 @@ const (
 	// Include the 4 KiB buffered read margin from net/http
 	maxDetectionSourceSize = maxHeaderBytes + 4*1024
 	// Leave room for Unicode case folding without losing the tail
-	maxCanonicalSourceSize = maxDetectionSourceSize * 2
-	maxDetectionSources    = 20
-	maxDecodePasses        = 12
-	maxNestedGzipLayers    = 8
-	maxBase64DecodePasses  = 3
-	maxGzipDecodedWorkSize = maxRequestBodySize * maxNestedGzipLayers
-	maxXMLExpansionSize    = maxRequestBodySize * 8
-	maxDataURIMetadataSize = 512
-	requestTimeout         = 5 * time.Second
-	shutdownTimeout        = 5 * time.Second
-	logBufferSize          = 100
-	logHighReserve         = 50
-	logMediumReserve       = 30
-	logWeakReserve         = 20
-	maxConcurrentPublic    = 128
-	maxConcurrentAdmin     = 32
-	envPublicAddr          = "GHONEY_ADDR"
-	envAdminAddr           = "GHONEY_ADMIN_ADDR"
-	envAdminUser           = "GHONEY_ADMIN_USER"
-	envAdminPassword       = "GHONEY_ADMIN_PASSWORD"
-	envAdminPasswordFile   = "GHONEY_ADMIN_PASSWORD_FILE"
-	defaultAdminUser       = "ghoney"
-	minAdminPasswordBytes  = 16
-	maxAdminPasswordBytes  = 256
-	maxJNDIExpansionPasses = 6
-	minBase64ValueSize     = 8
-	unknownMetricRoute     = "not_found"
-	unknownMetricMethod    = "OTHER"
+	maxCanonicalSourceSize     = maxDetectionSourceSize * 2
+	maxNormalizationVariants   = 64
+	maxDetectionDecodeWorkSize = maxDetectionSourceSize * 16
+	maxDetectionInputSize      = maxDetectionSourceSize * 4
+	maxNestedGzipLayers        = 8
+	maxGzipDecodedWorkSize     = maxRequestBodySize * maxNestedGzipLayers
+	maxXMLExpansionSize        = maxRequestBodySize * 8
+	minXMLExpansionSignalSize  = 256
+	maxDataURIMetadataSize     = 512
+	requestTimeout             = 5 * time.Second
+	shutdownTimeout            = 5 * time.Second
+	idleTimeout                = 15 * time.Second
+	logBufferSize              = 100
+	logHighReserve             = 50
+	logMediumReserve           = 30
+	logWeakReserve             = 20
+	maxConcurrentPublic        = 128
+	maxConcurrentAdmin         = 32
+	maxOpenPublicConnections   = 256
+	maxOpenAdminConnections    = 64
+	envPublicAddr              = "GHONEY_ADDR"
+	envAdminAddr               = "GHONEY_ADMIN_ADDR"
+	envAdminUser               = "GHONEY_ADMIN_USER"
+	envAdminPassword           = "GHONEY_ADMIN_PASSWORD"
+	envAdminPasswordFile       = "GHONEY_ADMIN_PASSWORD_FILE"
+	defaultAdminUser           = "ghoney"
+	minAdminPasswordBytes      = 16
+	maxAdminPasswordBytes      = 256
+	maxJNDIExpansionPasses     = 6
+	minBase64ValueSize         = 4
+	minBinaryTextRunSize       = 8
+	unknownMetricRoute         = "not_found"
+	unknownMetricMethod        = "OTHER"
 )
 
 // adminCredentials stores only fixed size credential hashes

@@ -105,7 +105,8 @@ func handleDashboardData(w http.ResponseWriter, r *http.Request) {
 
 // Log unknown public traffic before returning 404
 func handleNotFound(w http.ResponseWriter, r *http.Request) {
-	logEvent("info", remoteIP(r.RemoteAddr), r.UserAgent(), r.URL.Path, "NotFound", "Accessed undefined path", r.URL.RawQuery, "", "")
+	body, _ := r.Context().Value(inspectedBodyKey{}).(string)
+	logRequestEvent("info", r, "NotFound", "Accessed undefined path", body, "", detectionMatch{})
 	http.NotFound(w, r)
 }
 
@@ -139,7 +140,7 @@ func publicHandler() http.Handler {
 	mux.HandleFunc("/", handleNotFound)
 
 	handler := requestInspectionMiddleware(mux)
-	handler = concurrencyLimitMiddleware(maxConcurrentPublic, handler)
+	handler = concurrencyLimitMiddleware(maxConcurrentPublic, handler, http.HandlerFunc(handlePublicOverload))
 	handler = metricsMiddleware(handler)
 	handler = timeoutMiddleware(handler)
 	return securityHeadersMiddleware(handler)
@@ -168,7 +169,7 @@ func adminHandler(credentials adminCredentials) http.Handler {
 	var handler http.Handler = mux
 	handler = adminAuthMiddleware(credentials, handler)
 	handler = metricsMiddleware(handler)
-	handler = concurrencyLimitMiddleware(maxConcurrentAdmin, handler)
+	handler = concurrencyLimitMiddleware(maxConcurrentAdmin, handler, nil)
 	handler = timeoutMiddleware(handler)
 	return securityHeadersMiddleware(handler)
 }
@@ -205,7 +206,7 @@ func newHTTPServer(address string, handler http.Handler) *http.Server {
 		ReadHeaderTimeout: 3 * time.Second,
 		ReadTimeout:       requestTimeout + time.Second,
 		WriteTimeout:      requestTimeout + time.Second,
-		IdleTimeout:       60 * time.Second,
+		IdleTimeout:       idleTimeout,
 		MaxHeaderBytes:    maxHeaderBytes,
 	}
 }

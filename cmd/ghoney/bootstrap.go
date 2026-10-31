@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 )
@@ -135,6 +136,8 @@ func runWithDependencies(ctx context.Context, configuration appConfig, dependenc
 		closeErr := publicListener.Close()
 		return errors.Join(fmt.Errorf("listen on admin address %q: %w", configuration.adminAddr, err), closeErr)
 	}
+	publicListener = newLimitedListener(publicListener, maxOpenPublicConnections)
+	adminListener = newLimitedListener(adminListener, maxOpenAdminConnections)
 
 	servers := []*http.Server{
 		newHTTPServer(configuration.publicAddr, publicHandler()),
@@ -191,6 +194,58 @@ func runWithDependencies(ctx context.Context, configuration appConfig, dependenc
 		serveResults++
 	}
 	return errors.Join(collected...)
+}
+
+// limitedListener bounds accepted sockets, including idle keep-alive clients
+type limitedListener struct {
+	net.Listener
+	slots     chan struct{}
+	done      chan struct{}
+	closeOnce sync.Once
+}
+
+// newLimitedListener wraps one listener with a fixed connection budget
+func newLimitedListener(listener net.Listener, limit int) net.Listener {
+	return &limitedListener{
+		Listener: listener,
+		slots:    make(chan struct{}, limit),
+		done:     make(chan struct{}),
+	}
+}
+
+// Accept waits for capacity without preventing listener shutdown
+func (listener *limitedListener) Accept() (net.Conn, error) {
+	select {
+	case listener.slots <- struct{}{}:
+	case <-listener.done:
+		return nil, net.ErrClosed
+	}
+	connection, err := listener.Listener.Accept()
+	if err != nil {
+		<-listener.slots
+		return nil, err
+	}
+	return &limitedConnection{Conn: connection, release: func() { <-listener.slots }}, nil
+}
+
+// Close unblocks pending accepts before closing the underlying socket
+func (listener *limitedListener) Close() error {
+	listener.closeOnce.Do(func() { close(listener.done) })
+	return listener.Listener.Close()
+}
+
+// limitedConnection returns its listener slot exactly once
+type limitedConnection struct {
+	net.Conn
+	release   func()
+	closeOnce sync.Once
+}
+
+// Close releases capacity even when the underlying close reports an error
+func (connection *limitedConnection) Close() error {
+	err := connection.Conn.Close()
+	connection.closeOnce.Do(connection.release)
+	return err
 }
 
 // Ignore only the normal result of graceful shutdown

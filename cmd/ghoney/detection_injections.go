@@ -7,12 +7,11 @@ import (
 )
 
 // Match SQL syntax across raw and collapsed comment variants
-func firstSQLMatch(sources []detectionSource) (string, confidence) {
+func firstSQLMatch(sources []detectionSource) (detectionMatch, confidence) {
 	highPatterns := [...]*regexp.Regexp{
 		sqlQuotedBooleanRegex,
 		sqlTruncatedQuotedBooleanRegex,
 		sqlParenthesizedQuotedRegex,
-		sqlCommentTailRegex,
 		sqlUnionRegex,
 		sqlFunctionRegex,
 		sqlStructuredStackedRegex,
@@ -22,34 +21,58 @@ func firstSQLMatch(sources []detectionSource) (string, confidence) {
 		sqlFlexibleBooleanRegex,
 		sqlFlexibleHavingRegex,
 		sqlHexComparisonRegex,
+		sqlBareBooleanRegex,
+		sqlPredicateRegex,
+		sqlFunctionComparisonRegex,
+		sqlReconnaissanceRegex,
+		sqlBooleanExpressionRegex,
 		sqlSleepRegex,
 		sqlConditionalRegex,
 		sqlHavingRegex,
 		sqlStackedRegex,
+		sqlCommentTailRegex,
 	}
-	var mediumSource string
+	var mediumSource detectionMatch
 	for _, source := range sources {
 		for _, variant := range source.variants {
-			unwrapped := sqlVersionCommentRegex.ReplaceAllString(variant, " $1 ")
-			candidates := [...]string{
-				variant,
-				unwrapped,
-				sqlBlockCommentRegex.ReplaceAllString(unwrapped, ""),
-				sqlBlockCommentRegex.ReplaceAllString(unwrapped, " "),
+			if source.expired() {
+				break
 			}
+			if !hasSQLMarker(variant) {
+				continue
+			}
+			candidates := []string{variant}
+			if strings.Contains(variant, "/*") {
+				unwrapped := sqlVersionCommentRegex.ReplaceAllString(variant, " $1 ")
+				candidates = append(candidates, unwrapped, sqlBlockCommentRegex.ReplaceAllString(unwrapped, ""), sqlBlockCommentRegex.ReplaceAllString(unwrapped, " "))
+			}
+			seenCandidates := make(map[string]struct{}, len(candidates))
 			for _, candidate := range candidates {
+				if _, exists := seenCandidates[candidate]; exists {
+					continue
+				}
+				seenCandidates[candidate] = struct{}{}
 				if !hasSQLMarker(candidate) {
 					continue
 				}
 				for _, pattern := range highPatterns {
-					if pattern.MatchString(candidate) {
-						return source.name, confidenceHigh
+					if (pattern == sqlQuotedBooleanRegex || pattern == sqlTruncatedQuotedBooleanRegex || pattern == sqlParenthesizedQuotedRegex) && !strings.ContainsAny(candidate, "'\"`)") {
+						continue
+					}
+					if pattern == sqlUnionRegex && !strings.Contains(candidate, "union") {
+						continue
+					}
+					if pattern == sqlStructuredStackedRegex && !strings.Contains(candidate, ";") {
+						continue
+					}
+					if location := pattern.FindStringIndex(candidate); location != nil {
+						return evidenceMatch(source.name, candidate, location[0]), confidenceHigh
 					}
 				}
-				if mediumSource == "" {
+				if mediumSource.source == "" {
 					for _, pattern := range mediumPatterns {
-						if pattern.MatchString(candidate) {
-							mediumSource = source.name
+						if location := pattern.FindStringIndex(candidate); location != nil {
+							mediumSource = evidenceMatch(source.name, candidate, location[0])
 							break
 						}
 					}
@@ -57,16 +80,22 @@ func firstSQLMatch(sources []detectionSource) (string, confidence) {
 			}
 		}
 	}
-	if mediumSource != "" {
+	if mediumSource.source != "" {
 		return mediumSource, confidenceMedium
 	}
-	return "", ""
+	return detectionMatch{}, ""
 }
 
-// Skip expensive SQL expressions when no syntax-bearing token is present
+// Skip SQL matching when no SQL markers are present
 func hasSQLMarker(value string) bool {
+	// Every supported SQL shape needs an operand, delimiter or standalone construct
+	if !strings.ContainsAny(value, "0123456789'\"`();#") && !strings.Contains(value, "/*") &&
+		!strings.Contains(value, "union") && !strings.Contains(value, "true") && !strings.Contains(value, "false") &&
+		!strings.Contains(value, "waitfor") && !strings.Contains(value, "outfile") && !strings.Contains(value, "information_schema") {
+		return false
+	}
 	for _, marker := range [...]string{
-		"or", "and", "xor", "union", "select", "having", "case", "if(", "if (",
+		"order", "group", "limit", "offset", "procedure", "for update", "or", "and", "xor", "union", "select", "having", "between", " in ", " is ", "exists", "case", "if(", "if (",
 		"sleep", "benchmark", "pg_sleep", "load_file", "xp_cmdshell", "extractvalue",
 		"updatexml", "waitfor", "outfile", "information_schema", "insert", "update",
 		"delete", "drop", "alter", "create", "exec", "0x", "||", "&&", "--", "#", "/*",
@@ -79,8 +108,11 @@ func hasSQLMarker(value string) bool {
 }
 
 // Match shell signatures with a local quote splitting variant
-func firstCommandMatch(sources []detectionSource) (string, confidence) {
+func firstCommandMatch(sources []detectionSource) (detectionMatch, confidence) {
+	sources = sourcesWithMarker(sources, hasCommandMarker)
 	highPatterns := []*regexp.Regexp{
+		commandBase64SeparatorRegex,
+		commandShellVariableRegex,
 		commandAssignmentRegex,
 		commandSubstitutionRegex,
 		commandStrongSeparatorRegex,
@@ -89,21 +121,110 @@ func firstCommandMatch(sources []detectionSource) (string, confidence) {
 		commandWildcardRegex,
 		commandShellStructureRegex,
 	}
-	mediumPatterns := []*regexp.Regexp{commandAmbiguousSeparatorRegex, commandGenericAssignmentRegex}
+	mediumPatterns := []*regexp.Regexp{commandAmbiguousSeparatorRegex, commandExecutablePathRegex, commandGenericAssignmentRegex}
 	if source, ok := firstDerivedRegexMatch(sources, highPatterns, normalizeShellSyntax); ok {
 		return source, confidenceHigh
 	}
 	if source, ok := firstDerivedRegexMatch(sources, mediumPatterns, normalizeShellSyntax); ok {
 		return source, confidenceMedium
 	}
-	return "", ""
+	return detectionMatch{}, ""
+}
+
+// Skip plain prose and numeric assignments without excluding shell separators
+func hasCommandMarker(value string) bool {
+	if strings.ContainsAny(value, ";|\r\n$`\\") || strings.Contains(value, "&&") {
+		return true
+	}
+	for index := 0; index < len(value); index++ {
+		if value[index] != '=' && value[index] != ':' && value[index] != '&' {
+			continue
+		}
+		candidate := strings.TrimLeft(value[index+1:], " \t\"'({")
+		if candidate == "" {
+			continue
+		}
+		if value[index] == '&' {
+			end := 0
+			for end < len(candidate) && isShellWordByte(candidate[end]) {
+				end++
+			}
+			if end < len(candidate) && candidate[end] == '=' {
+				continue
+			}
+		}
+		if candidate[0] >= 'a' && candidate[0] <= 'z' || candidate[0] == '/' || candidate[0] == '_' {
+			return true
+		}
+	}
+	return false
 }
 
 // Normalize bounded shell separators and escaped command names before matching
 func normalizeShellSyntax(value string) string {
+	value = shellEmptyExpansionRegex.ReplaceAllString(value, "$1$2")
+	value = shellDefaultExpansionRegex.ReplaceAllString(value, "$1")
 	value = normalizeShellVariables(value)
+	value = decodeShellANSIQuotes(value)
 	value = collapseShellEscapes(value)
 	return collapseShellWordQuotes(value)
+}
+
+// Decode bounded ANSI-C shell quotes used to hide command names
+func decodeShellANSIQuotes(value string) string {
+	var normalized strings.Builder
+	normalized.Grow(len(value))
+	changed := false
+	for index := 0; index < len(value); {
+		if index+2 >= len(value) || value[index] != '$' || value[index+1] != '\'' {
+			normalized.WriteByte(value[index])
+			index++
+			continue
+		}
+		end := strings.IndexByte(value[index+2:], '\'')
+		if end < 0 || end > 256 {
+			normalized.WriteByte(value[index])
+			index++
+			continue
+		}
+		body := value[index+2 : index+2+end]
+		decoded, ok := decodeShellANSIBody(body)
+		if !ok {
+			normalized.WriteString(value[index : index+3+end])
+			index += end + 3
+			continue
+		}
+		normalized.WriteString(decoded)
+		index += end + 3
+		changed = true
+	}
+	if !changed {
+		return value
+	}
+	return normalized.String()
+}
+
+// Interpret only fixed-width hexadecimal escapes and ordinary quoted bytes
+func decodeShellANSIBody(value string) (string, bool) {
+	var decoded strings.Builder
+	decoded.Grow(len(value))
+	for index := 0; index < len(value); index++ {
+		if value[index] != '\\' {
+			decoded.WriteByte(value[index])
+			continue
+		}
+		if index+3 >= len(value) || value[index+1] != 'x' {
+			return "", false
+		}
+		high, highOK := hexNibble(value[index+2])
+		low, lowOK := hexNibble(value[index+3])
+		if !highOK || !lowOK {
+			return "", false
+		}
+		decoded.WriteByte(high<<4 | low)
+		index += 3
+	}
+	return decoded.String(), true
 }
 
 // Replace shell variables commonly used to hide spaces and path separators
@@ -169,24 +290,27 @@ func collapseShellEscapes(value string) string {
 	return collapsed.String()
 }
 
-// Match raw and family specific variants without changing shared sources
-func firstDerivedRegexMatch(sources []detectionSource, patterns []*regexp.Regexp, derive func(string) string) (string, bool) {
+// Match raw and derived variants without modifying the sources
+func firstDerivedRegexMatch(sources []detectionSource, patterns []*regexp.Regexp, derive func(string) string) (detectionMatch, bool) {
 	for _, source := range sources {
 		for _, variant := range source.variants {
+			if source.expired() {
+				break
+			}
 			candidates := [...]string{variant, derive(variant)}
 			for index, candidate := range candidates {
 				if index == 1 && candidate == variant {
 					continue
 				}
 				for _, pattern := range patterns {
-					if pattern.MatchString(candidate) {
-						return source.name, true
+					if location := pattern.FindStringIndex(candidate); location != nil {
+						return evidenceMatch(source.name, candidate, location[0]), true
 					}
 				}
 			}
 		}
 	}
-	return "", false
+	return detectionMatch{}, false
 }
 
 // Collapse balanced quotes when they split or end a shell word
@@ -240,8 +364,9 @@ func isShellWordByte(value byte) bool {
 }
 
 // Keep active browser constructs above ambiguous standalone tags and schemes
-func firstXSSMatch(sources []detectionSource) (string, confidence) {
+func firstXSSMatch(sources []detectionSource) (detectionMatch, confidence) {
 	xssSources := mergeXSSDetectionVariants(sources)
+	xssSources = sourcesWithMarker(xssSources, func(value string) bool { return strings.ContainsAny(value, "<:") || strings.Contains(value, "on") })
 	if source, ok := firstRegexMatch(xssSources, xssActiveTagRegex, xssEventHandlerRegex, xssTagEventHandlerRegex, xssSVGAnimationHandlerRegex); ok {
 		return source, confidenceHigh
 	}
@@ -251,7 +376,7 @@ func firstXSSMatch(sources []detectionSource) (string, confidence) {
 	if source, ok := firstDerivedRegexMatch(xssSources, []*regexp.Regexp{xssJavaScriptURIRegex, xssVBScriptURIRegex}, removeURLIgnoredControls); ok {
 		return source, confidenceMedium
 	}
-	return "", ""
+	return detectionMatch{}, ""
 }
 
 // Merge browser-only decodings without exposing them to unrelated detectors
@@ -279,10 +404,17 @@ func removeURLIgnoredControls(value string) string {
 	return urlIgnoredControlReplacer.Replace(value)
 }
 
-// Expand nested JNDI character tricks within a fixed budget
-func firstJNDIMatch(sources []detectionSource) (string, bool) {
+// Expand nested JNDI tricks and distinguish explicit lookups from bare probes
+func firstJNDIMatch(sources []detectionSource) (detectionMatch, confidence) {
+	mediumSource := detectionMatch{}
 	for _, source := range sources {
 		for _, variant := range source.variants {
+			if source.expired() {
+				break
+			}
+			if !strings.Contains(variant, "jndi") && !strings.Contains(variant, "${") {
+				continue
+			}
 			candidate := variant
 			changed := false
 			for pass := 0; pass < maxJNDIExpansionPasses; pass++ {
@@ -297,11 +429,17 @@ func firstJNDIMatch(sources []detectionSource) (string, bool) {
 				changed = true
 			}
 			if jndiLookupRegex.MatchString(candidate) || changed && jndiExpandedLookupRegex.MatchString(candidate) {
-				return source.name, true
+				return evidenceMatch(source.name, candidate, max(0, strings.Index(candidate, "jndi"))), confidenceHigh
+			}
+			if mediumSource.source == "" && jndiProtocolRegex.MatchString(candidate) {
+				mediumSource = evidenceMatch(source.name, candidate, max(0, strings.Index(candidate, "jndi")))
 			}
 		}
 	}
-	return "", false
+	if mediumSource.source != "" {
+		return mediumSource, confidenceMedium
+	}
+	return detectionMatch{}, ""
 }
 
 // Resolve innermost lookup fragments that can contribute characters to JNDI
@@ -375,46 +513,44 @@ func jndiLookupFragment(body string) (string, bool) {
 	}
 }
 
-// Match explicit NoSQL keys in JSON objects, query strings and form bodies
-func firstNoSQLMatch(input detectionInput) (string, confidence) {
-	bestSource := ""
+// Find NoSQL operators in decoded fields
+func firstNoSQLMatch(sources []detectionSource) (detectionMatch, confidence) {
 	best := confidence("")
-	keepStrongest := func(source string, value confidence) bool {
-		if confidenceRank(value) > confidenceRank(best) {
-			bestSource = source
-			best = value
-		}
-		return best == confidenceHigh
-	}
-
-	if keepStrongest("request body", noSQLJSONConfidence(input.Body)) {
-		return bestSource, best
-	}
-	for _, candidate := range normalizeDetectionVariants(input.RawQuery, true) {
-		if keepStrongest("query string", noSQLParameterConfidence(candidate)) {
-			return bestSource, best
-		}
-	}
-	if isFormContentType(input.Header.Get("Content-Type")) {
-		for _, candidate := range normalizeDetectionVariants(input.Body, true) {
-			if keepStrongest("request body", noSQLParameterConfidence(candidate)) {
-				return bestSource, best
+	match := detectionMatch{}
+	for _, source := range sources {
+		for _, candidate := range source.variants {
+			if source.expired() {
+				break
+			}
+			if !strings.Contains(candidate, "$") && !strings.Contains(candidate, `\u`) {
+				continue
+			}
+			value := maxConfidence(noSQLJSONConfidence(candidate), noSQLParameterConfidence(candidate))
+			if confidenceRank(value) > confidenceRank(best) {
+				best = value
+				match = evidenceMatch(source.name, candidate, noSQLEvidenceOffset(candidate, best))
+			}
+			if best == confidenceHigh {
+				return match, best
 			}
 		}
 	}
-	if isMultipartContentType(input.Header.Get("Content-Type")) {
-		if fields, ok := parseMultipartTextFields(input.Body, input.Header.Get("Content-Type")); ok {
-			for _, field := range fields {
-				if keepStrongest("request body", noSQLKeyConfidence(field.key)) {
-					return bestSource, best
-				}
-			}
-		}
-	}
-	return bestSource, best
+	return match, best
 }
 
-// Read NoSQL operators from JSON keys rather than values
+// Prefer an operator key over an earlier mention inside a JSON value
+func noSQLEvidenceOffset(value string, best confidence) int {
+	for _, location := range noSQLJSONKeyRegex.FindAllStringIndex(value, -1) {
+		literal, _, _ := strings.Cut(strings.TrimSpace(value[location[0]:location[1]]), ":")
+		var key string
+		if json.Unmarshal([]byte(strings.TrimSpace(literal)), &key) == nil && noSQLKeyConfidence(key) == best {
+			return location[0]
+		}
+	}
+	return max(0, strings.IndexByte(value, '$'))
+}
+
+// Read operators from JSON objects
 func noSQLJSONConfidence(body string) confidence {
 	if body == "" || len(body) > maxRequestBodySize || !json.Valid([]byte(body)) {
 		return ""
@@ -438,6 +574,10 @@ func noSQLValueConfidence(value any) confidence {
 				return best
 			}
 		}
+	case string:
+		if strings.HasPrefix(strings.TrimSpace(typed), "{") || strings.HasPrefix(strings.TrimSpace(typed), "[") {
+			best = noSQLJSONConfidence(typed)
+		}
 	case []any:
 		for _, child := range typed {
 			best = maxConfidence(best, noSQLValueConfidence(child))
@@ -449,15 +589,16 @@ func noSQLValueConfidence(value any) confidence {
 	return best
 }
 
-// Require dotted or bracket notation in query and form keys
+// Read operators from parameter keys and JSON values
 func noSQLParameterConfidence(value string) confidence {
 	best := confidence("")
 	for _, field := range strings.FieldsFunc(value, func(r rune) bool { return r == '&' || r == ';' }) {
-		key, _, found := strings.Cut(strings.TrimSpace(field), "=")
-		if !found || (!strings.Contains(key, ".") && !(strings.Contains(key, "[") && strings.Contains(key, "]"))) {
+		key, candidate, found := strings.Cut(strings.TrimSpace(field), "=")
+		if !found {
 			continue
 		}
 		best = maxConfidence(best, noSQLKeyConfidence(key))
+		best = maxConfidence(best, noSQLJSONConfidence(candidate))
 		if best == confidenceHigh {
 			return best
 		}
@@ -473,7 +614,7 @@ func noSQLKeyConfidence(key string) confidence {
 		switch component {
 		case "$where", "$function", "$accumulator":
 			return confidenceHigh
-		case "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$regex", "$exists",
+		case "$set", "$unset", "$inc", "$push", "$pull", "$rename", "$lookup", "$group", "$match", "$out", "$merge", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$regex", "$exists",
 			"$or", "$and", "$nor", "$not", "$expr", "$mod", "$size", "$all", "$elemmatch", "$type",
 			"$jsonschema", "$text", "$near", "$nearsphere", "$geowithin", "$geointersects",
 			"$bit", "$bitand", "$bitor", "$bitsallclear", "$bitsallset", "$bitsanyclear", "$bitsanyset":

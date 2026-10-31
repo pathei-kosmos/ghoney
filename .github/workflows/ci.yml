@@ -17,6 +17,9 @@ jobs:
       - name: Check out source
         # Pin third-party workflow code while Dependabot tracks v6 updates
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          # Fetch the full history for secret scanning
+          fetch-depth: 0
 
       - name: Set up Go
         # Pin third-party workflow code while Dependabot tracks v7 updates
@@ -39,6 +42,26 @@ jobs:
       - name: Run static analysis
         run: go vet ./...
 
+      - name: Check JavaScript syntax
+        run: |
+          # Check syntax in both browser scripts
+          node --check cmd/ghoney/static/app.js
+          node --check cmd/ghoney/static/admin-login.js
+
+      - name: Check reachable Go vulnerabilities
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.9.0 ./...
+
+      - name: Scan source and history for secrets
+        shell: bash
+        run: |
+          # Pin the scanner and redact any accidental findings in CI output
+          go install github.com/zricethezav/gitleaks/v8@v8.30.0
+          "$(go env GOPATH)/bin/gitleaks" dir --redact --no-banner .
+          "$(go env GOPATH)/bin/gitleaks" git --redact --no-banner --log-opts=--all .
+
+      - name: Fuzz bounded detection decoding
+        run: go test ./cmd/ghoney -run='^$' -fuzz=FuzzDetectionDecoding -fuzztime=15s -parallel=2
+
   containers:
     needs: verify
     runs-on: ubuntu-latest
@@ -46,7 +69,7 @@ jobs:
 
     steps:
       - name: Check out source
-        # Use the same reviewed checkout revision in every job
+        # Use the same checkout version in both jobs
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Build hardened image
@@ -55,10 +78,10 @@ jobs:
       - name: Smoke test standard Docker isolation
         shell: bash
         run: |
-          # Cleanup also runs after failed assertions
+          # Remove the container even if a check fails
           cleanup() { docker rm -f ghoney-ci >/dev/null 2>&1 || true; }
           trap cleanup EXIT
-          # Keep synthetic credentials scoped to this smoke test
+          # Use test credentials only for this container
           admin_user=ghoney
           admin_password=ci-admin-password
 
@@ -95,7 +118,7 @@ jobs:
             rmdir "$secret_directory"
           }
           trap cleanup EXIT
-          # Keep synthetic credentials scoped to this smoke test
+          # Use test credentials only for this container
           admin_user=ghoney
           admin_password=ci-admin-password
           printf '%s\n' "$admin_password" > "$secret_file"
@@ -139,7 +162,6 @@ jobs:
           sudo runsc install
           sudo systemctl restart docker
           docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'
-          docker run --rm --runtime=runsc hello-world
 
       - name: Smoke test gVisor with custom seccomp
         shell: bash
@@ -147,7 +169,7 @@ jobs:
           # Run the documented runsc and Seccomp combination
           cleanup() { docker rm -f ghoney-runsc >/dev/null 2>&1 || true; }
           trap cleanup EXIT
-          # Keep synthetic credentials scoped to this smoke test
+          # Use test credentials only for this container
           admin_user=ghoney
           admin_password=ci-admin-password
 
